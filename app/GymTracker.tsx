@@ -635,7 +635,9 @@ export default function GymTracker() {
                   onInput={(e) => setState({ draft: (e.target as HTMLInputElement).value })}
                   onKeyDown={(e) => { if (e.key === "Enter" && !state.thinking) send(); }}
                   placeholder="Ask for anything — “make today easier”, “plan my week”…"
-                  style={{ flex: 1, minWidth: 0, border: "1px solid #dcdad3", borderRadius: 22, padding: "12px 16px", font: "400 14px var(--font-hanken)", background: "#fff", outline: "none" }}
+                  /* 16px, not 14 — iOS Safari auto-zooms the page on focus for anything
+                     smaller, and we can't lock that out with maximumScale (see layout.tsx). */
+                  style={{ flex: 1, minWidth: 0, border: "1px solid #dcdad3", borderRadius: 22, padding: "11px 16px", font: "400 16px var(--font-hanken)", background: "#fff", outline: "none" }}
                 />
                 <button onClick={send} disabled={state.thinking || !state.draft.trim()} style={{ width: 44, height: 44, borderRadius: "50%", background: state.thinking || !state.draft.trim() ? "#c3c1b8" : "#12120f", color: "#fff", border: "none", fontSize: 18, cursor: state.thinking ? "default" : "pointer", flex: "none" }}>↑</button>
               </div>
