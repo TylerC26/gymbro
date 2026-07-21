@@ -1,7 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
-import { appendMessages, loadState, seedRemote } from "@/lib/db";
-import { buildSeed } from "@/lib/seed";
+import { appendMessages, loadState } from "@/lib/db";
 import { todayISO } from "@/lib/types";
 import { buildContext, SYSTEM_PROMPT } from "@/lib/coach/context";
 import { EXECUTORS, TOOLS, type ToolContext } from "@/lib/coach/tools";
@@ -62,12 +61,7 @@ export async function POST(req: Request) {
   if (authError || !userId) return NextResponse.json({ error: "Session expired — reload the app." }, { status: 401 });
 
   try {
-    let state = await loadState(supabase, userId);
-    if (!state) {
-      await seedRemote(supabase, userId, buildSeed(today));
-      state = await loadState(supabase, userId);
-    }
-    if (!state) return NextResponse.json({ error: "Could not read your training log." }, { status: 500 });
+    const state = await loadState(supabase, userId);
 
     const startPos = state.messages.length;
     const ctx: ToolContext = { supabase, userId, today, state };
@@ -140,7 +134,7 @@ export async function POST(req: Request) {
     );
 
     /* Return the re-read state so the client renders exactly what's stored. */
-    const fresh = (await loadState(supabase, userId)) ?? ctx.state;
+    const fresh = await loadState(supabase, userId);
     return NextResponse.json({ reply, actions, state: fresh, model: MINIMAX_MODEL });
   } catch (err) {
     const message =

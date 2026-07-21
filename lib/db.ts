@@ -11,9 +11,9 @@ const byPos = <T extends { position: number }>(a: T, b: T) => a.position - b.pos
 
 /* ----------------------------------------------------------------- load */
 
-/** Assemble the whole athlete state. Returns null for a brand-new user
- *  (no sessions yet), which tells the caller to seed. */
-export async function loadState(s: SupabaseClient, userId: string): Promise<PersistedState | null> {
+/** Assemble the whole athlete state. A brand-new athlete simply has an empty
+ *  log — the app never invents training history on their behalf. */
+export async function loadState(s: SupabaseClient, userId: string): Promise<PersistedState> {
   const [workoutsRes, exercisesRes, setsRes, recordsRes, recSessRes, messagesRes, bwRes, memRes] = await Promise.all([
     s.from("workouts").select("*").eq("user_id", userId).order("scheduled_date"),
     s.from("workout_exercises").select("*").eq("user_id", userId),
@@ -25,10 +25,14 @@ export async function loadState(s: SupabaseClient, userId: string): Promise<Pers
     s.from("coach_memory").select("*").eq("user_id", userId),
   ]);
 
+  /* A failed read must not pass for an empty log: with nothing to seed over it,
+   * a dropped connection would render as "nothing planned" and invite the
+   * athlete to re-plan a week they already have. */
+  for (const res of [workoutsRes, exercisesRes, setsRes, recordsRes, recSessRes, messagesRes, bwRes, memRes]) {
+    if (res.error) throw new Error(`could not read your training log: ${res.error.message}`);
+  }
+
   const workouts = (workoutsRes.data ?? []).filter((w) => w.scheduled_date);
-  /* Only a truly untouched account gets seeded — an athlete who let the coach
-   * clear their calendar must not have a month of history conjured back. */
-  if (workouts.length === 0 && (messagesRes.data ?? []).length === 0) return null;
 
   const exercises = exercisesRes.data ?? [];
   const sets = setsRes.data ?? [];
@@ -193,63 +197,4 @@ export async function deleteMemory(s: SupabaseClient, userId: string, key: strin
   await s.from("coach_memory").delete().eq("user_id", userId).eq("key", key);
 }
 
-/* -------------------------------------------------------------------- seed */
-
-export async function seedRemote(s: SupabaseClient, userId: string, init: PersistedState) {
-  /* Bulk-inserted rather than looping saveSession: a seed is ~35 days of
-   * history and one round trip per day makes first load crawl. */
-  const { data: wIns, error } = await s
-    .from("workouts")
-    .insert(
-      init.sessions.map((p, i) => ({
-        user_id: userId,
-        kind: "session",
-        scheduled_date: p.date,
-        title: p.title,
-        subtitle: p.groups,
-        plan: p.plan,
-        completed: p.completed,
-        notes: p.notes,
-        color: "",
-        date_label: "",
-        position: i,
-      })),
-    )
-    .select("id,position");
-  if (error) throw new Error(error.message);
-
-  const workoutIdByPos = new Map((wIns ?? []).map((r) => [r.position, r.id]));
-  const exRows: Record<string, unknown>[] = [];
-  init.sessions.forEach((p, i) => {
-    const wid = workoutIdByPos.get(i);
-    if (!wid) return;
-    p.exercises.forEach((e, j) => exRows.push({ workout_id: wid, user_id: userId, name: e.name, scheme: "", position: j }));
-  });
-
-  if (exRows.length) {
-    const { data: exIns, error: exErr } = await s.from("workout_exercises").insert(exRows).select("id,workout_id,position");
-    if (exErr) throw new Error(exErr.message);
-    const exIdByKey = new Map((exIns ?? []).map((r) => [`${r.workout_id}:${r.position}`, r.id]));
-    const setRows: Record<string, unknown>[] = [];
-    init.sessions.forEach((p, i) => {
-      const wid = workoutIdByPos.get(i);
-      if (!wid) return;
-      p.exercises.forEach((e, j) => {
-        const exId = exIdByKey.get(`${wid}:${j}`);
-        if (!exId) return;
-        e.sets.forEach((st, k) =>
-          setRows.push({ exercise_id: exId, user_id: userId, position: k, weight_kg: st.w, reps: st.r, done: st.d }),
-        );
-      });
-    });
-    if (setRows.length) await s.from("exercise_sets").insert(setRows);
-  }
-
-  await saveRecords(s, userId, init.records);
-  await appendMessages(s, userId, init.messages, 0);
-  if (init.weighIns.length) {
-    await s.from("body_weight_logs").insert(
-      init.weighIns.map((w) => ({ user_id: userId, weight_kg: w.kg, logged_at: new Date(`${w.date}T12:00:00`).toISOString() })),
-    );
-  }
-}
+/* No seeding: a new athlete's log starts empty and fills up as they train. */

@@ -14,8 +14,7 @@ import {
   toISO,
 } from "@/lib/types";
 import { ensureUserId, getAccessToken, getSupabase, isSupabaseConfigured } from "@/lib/supabaseClient";
-import { loadState, saveSession, seedRemote } from "@/lib/db";
-import { buildSeed } from "@/lib/seed";
+import { loadState, saveSession } from "@/lib/db";
 
 const STORAGE_KEY = "gymbro-state-v2";
 
@@ -94,31 +93,26 @@ export default function GymTracker() {
     [setState, today],
   );
 
-  // Hydrate once on mount: sign in anonymously, load rows (seeding a fresh user).
+  // Hydrate once on mount: sign in anonymously and load whatever rows exist.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const seed = buildSeed(today);
       if (isSupabaseConfigured) {
         const uid = await ensureUserId();
         const supabase = getSupabase();
         if (uid && supabase && !cancelled) {
           userIdRef.current = uid;
           try {
-            let data = await loadState(supabase, uid);
-            if (!data) {
-              await seedRemote(supabase, uid, seed);
-              data = await loadState(supabase, uid);
-            }
-            if (data && !cancelled) adoptPersisted(data);
+            const data = await loadState(supabase, uid);
+            if (!cancelled) adoptPersisted(data);
           } catch (e) {
             if (!cancelled) setError(e instanceof Error ? e.message : "Could not reach your training log.");
           }
         } else if (!cancelled) {
-          loadLocal(seed);
+          loadLocal();
         }
       } else if (!cancelled) {
-        loadLocal(seed);
+        loadLocal();
       }
       if (!cancelled) {
         hydratedRef.current = true;
@@ -126,12 +120,12 @@ export default function GymTracker() {
       }
     })();
 
-    function loadLocal(seed: PersistedState) {
+    function loadLocal() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        adoptPersisted(raw ? (JSON.parse(raw) as PersistedState) : seed);
+        if (raw) adoptPersisted(JSON.parse(raw) as PersistedState);
       } catch {
-        adoptPersisted(seed);
+        /* A corrupt cache is just an empty log; the athlete can plan from here. */
       }
     }
 

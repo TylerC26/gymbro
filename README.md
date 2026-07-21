@@ -73,9 +73,9 @@ Supabase needs:
 `MINIMAX_API_KEY` is server-side only; it is read by `/api/coach` and never reaches
 the browser. `MINIMAX_MODEL` (default `MiniMax-M2.1`) and `MINIMAX_BASE_URL` are optional.
 
-A brand-new device signs in anonymously and gets seeded with a month of plausible
-PPL history built around the day it first opens the app, so every chart and dot is live
-from the first render.
+A brand-new device signs in anonymously and starts with a genuinely empty log —
+no invented history. Ask the coach to plan your week and the calendar, charts and
+records fill in from what you actually train.
 
 ## Tests
 
@@ -101,5 +101,5 @@ Zero-config on Vercel — set the three env vars in the project settings, then `
 ## Layout
 
 `app/GymTracker.tsx` holds the UI; `lib/` holds the data layer (`db.ts`), types and
-date helpers (`types.ts`), seed data (`seed.ts`), the MiniMax client (`minimax.ts`)
-and the coach's prompt + tools (`coach/`).
+date helpers (`types.ts`), a sample-log builder used only as a test fixture
+(`seed.ts`), the MiniMax client (`minimax.ts`) and the coach's prompt + tools (`coach/`).
