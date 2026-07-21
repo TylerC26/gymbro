@@ -9,6 +9,10 @@ html,
 body {
   margin: 0;
   padding: 0;
+  /* The shell is exactly one viewport tall and .body does all the scrolling.
+     If the document scrolls too, the tab bar rides up out of view with it. */
+  height: 100%;
+  overflow: hidden;
 }
 
 button {
@@ -20,8 +24,6 @@ body {
   background: #faf9f6;
   color: #12120f;
   font-family: var(--font-hanken), system-ui, sans-serif;
-  min-height: 100vh;
-  min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -37,15 +39,21 @@ a:hover {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  height: 100dvh;
+  /* 100% of a viewport-height html/body — steadier than 100vh on mobile, where
+     vh keeps counting the collapsed URL bar and pushes the tab bar off-screen. */
+  height: 100%;
   background: #faf9f6;
   padding-top: env(safe-area-inset-top);
 }
 
 .body {
   flex: 1;
+  /* min-height:0 lets this flex child actually shrink; without it a long list
+     grows the shell past the viewport and takes the tab bar down with it. */
+  min-height: 0;
   overflow-y: auto;
+  /* Don't chain the bounce to the document once this hits its end. */
+  overscroll-behavior: contain;
   position: relative;
   -webkit-overflow-scrolling: touch;
 }

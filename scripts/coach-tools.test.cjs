@@ -119,6 +119,23 @@ async function expectThrow(label, fn, match) {
   await expectThrow("a new record needs a split", () => run("upsert_record", { name: "Hip Thrust", kg: 100 }, ctx), /pass plan/);
   msg = await run("upsert_record", { name: "Hip Thrust", kg: 100, plan: "legs" }, ctx);
   check("upsert_record creates a new PR", ctx.state.records.some((r) => r.name === "Hip Thrust"), msg);
+  check("a new record lands at the front", ctx.state.records[0].name === "Hip Thrust");
+
+  /* Progress shows only the top few per split, so "most recently touched" has to
+   * mean "first in the list" — there is no updated_at to sort on. */
+  ctx = newCtx();
+  const startedAt = ctx.state.records.map((r) => r.name);
+  const buried = startedAt[startedAt.length - 1];
+  await run("upsert_record", { name: buried, kg: 999 }, ctx);
+  check("updating a record moves it to the front", ctx.state.records[0].name === buried,
+    `${buried} was last of ${startedAt.length}`);
+  check("moving a record does not duplicate or drop any",
+    ctx.state.records.length === startedAt.length &&
+    new Set(ctx.state.records.map((r) => r.name)).size === startedAt.length);
+
+  await run("upsert_record", { name: startedAt[0], kg: 111 }, ctx);
+  check("the previously touched record slides to second",
+    ctx.state.records[0].name === startedAt[0] && ctx.state.records[1].name === buried);
 
   /* The seed already logs a weigh-in for today, so re-logging must correct it
    * rather than stack a second entry on the same date. */

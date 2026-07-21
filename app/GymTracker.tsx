@@ -18,6 +18,15 @@ import { loadState, saveSession } from "@/lib/db";
 
 const STORAGE_KEY = "gymbro-state-v2";
 
+/* A full lift library is a wall of text on a phone. Show the few each split is
+ * actually moving on; the rest are one tap away. */
+const TOP_RECORDS = 3;
+
+/* The composer grows with the message instead of scrolling a single line out of
+ * sight, up to about six lines — past that it keeps its own scrollbar so the
+ * transcript above never gets squeezed off the screen. */
+const DRAFT_MAX_HEIGHT = 132;
+
 const EMPTY: State = {
   sessions: [],
   records: [],
@@ -31,8 +40,6 @@ const EMPTY: State = {
   modalPlan: null,
   dragY: 0,
   dragging: false,
-  timerSec: 0,
-  timerRunning: false,
   thinking: false,
 };
 
@@ -67,10 +74,11 @@ export default function GymTracker() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [month, setMonth] = useState(() => `${todayISO().slice(0, 7)}-01`);
+  const [showAll, setShowAll] = useState<Record<string, boolean>>({});
 
-  const timerRef = useRef<number | null>(null);
   const dy0 = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
+  const draftRef = useRef<HTMLTextAreaElement>(null);
 
   /* setState with merge semantics */
   const setState = useCallback(
@@ -209,22 +217,20 @@ export default function GymTracker() {
     }
   }, [state]);
 
-  /* ---- timer ---- */
-  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
-  const toggleTimer = () => {
-    if (state.timerRunning) {
-      if (timerRef.current) clearInterval(timerRef.current);
-      setState({ timerRunning: false });
-    } else {
-      timerRef.current = window.setInterval(() => setState((s) => ({ timerSec: s.timerSec + 1 })), 1000);
-      setState({ timerRunning: true });
-    }
-  };
-
   /* ---- keep chat pinned to the latest message ---- */
   useEffect(() => {
     if (state.tab === "coach" && chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [state.messages, state.thinking, state.tab]);
+
+  /* ---- grow the composer to fit the message, and snap back once it sends ---- */
+  useEffect(() => {
+    const el = draftRef.current;
+    if (!el) return;
+    /* Reset before measuring: scrollHeight never reports smaller than the
+     * current height, so without this the box could only ever grow. */
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, DRAFT_MAX_HEIGHT)}px`;
+  }, [state.draft, state.tab]);
 
   /* ---- workout editing (writes into today's session) ---- */
   const patchToday = (fn: (ex: Exercise[]) => Exercise[]) =>
@@ -280,14 +286,10 @@ export default function GymTracker() {
   const send = () => askCoach(state.draft);
 
   /* ---- finish workout → let the coach log it and write the summary ---- */
-  const finish = () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    const mins = Math.round(state.timerSec / 60);
-    setState({ timerRunning: false });
+  const finish = () =>
     askCoach(
-      `I've finished today's session${mins ? ` — it took about ${mins} minutes` : ""}. Log it as complete, then give me the breakdown: volume, sets completed, and what to change next time.`,
+      "I've finished today's session. Log it as complete, then give me the breakdown: volume, sets completed, and what to change next time.",
     );
-  };
 
   /* ---- modal (a scheduled session) ---- */
   const closeModal = () => setState({ modalPlan: null, dragY: 0, dragging: false });
@@ -332,7 +334,6 @@ export default function GymTracker() {
 
   /* ---- derived ---- */
   const doneCount = workout.filter((ex) => ex.sets.length > 0 && ex.sets.every((x) => x.d)).length;
-  const timerLabel = Math.floor(state.timerSec / 60).toString().padStart(2, "0") + ":" + (state.timerSec % 60).toString().padStart(2, "0");
   const sign = (v: number) => (v >= 0 ? "+" : "−") + Math.abs(v);
   const modal = state.modalPlan ? byDate.get(state.modalPlan) ?? null : null;
 
@@ -414,15 +415,8 @@ export default function GymTracker() {
                 <div className="klabel">{longLabel(today)}</div>
                 <div style={{ width: 34, height: 34, borderRadius: "50%", background: "#e2e0da" }} />
               </div>
-              <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, margin: "20px 0 4px" }}>
+              <div style={{ margin: "20px 0 4px" }}>
                 <h1 style={{ margin: 0, fontSize: 38, fontWeight: 800, lineHeight: 0.98, letterSpacing: "-.02em" }}>{todaySession?.title ?? "Nothing planned"}</h1>
-                <button
-                  onClick={toggleTimer}
-                  style={{ display: "flex", alignItems: "center", gap: 7, border: `1px solid ${state.timerRunning ? "#3c8cff" : "#dcdad3"}`, background: state.timerRunning ? "#eaf2ff" : "#fff", color: state.timerRunning ? "#2d6fd0" : "#12120f", borderRadius: 12, padding: "7px 12px", cursor: "pointer", flex: "none", transform: "translateY(-3px)" }}
-                >
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: state.timerRunning ? "#3c8cff" : "#c3c1b8" }} />
-                  <span className="mono" style={{ fontSize: 16, fontWeight: 700, letterSpacing: ".02em" }}>{timerLabel}</span>
-                </button>
               </div>
               <div style={{ fontSize: 15, color: "#6b6b64" }}>{todaySession?.groups ?? "Ask your coach to plan something"}</div>
               {workout.length > 0 && (
@@ -464,8 +458,11 @@ export default function GymTracker() {
                     </button>
                     {open && (
                       <div style={{ padding: "2px 0 16px 30px", display: "flex", flexDirection: "column", gap: 6 }}>
+                        {/* Set rows fill the column at any window size: the label sits left,
+                            the number controls ride the right edge, and the gap tightens on
+                            narrow phones where the fixed children would otherwise overflow. */}
                         {ex.sets.map((st, j) => (
-                          <div key={j} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", maxWidth: 296, padding: "7px 12px", borderRadius: 13, background: j % 2 === 0 ? "#eef2fa" : "#f5f4f1" }}>
+                          <div key={j} style={{ display: "flex", alignItems: "center", gap: "clamp(6px, 1.8vw, 10px)", width: "100%", padding: "7px 12px", borderRadius: 13, background: j % 2 === 0 ? "#eef2fa" : "#f5f4f1" }}>
                             <button
                               onClick={() => toggleSet(i, j)}
                               aria-label={`Mark set ${j + 1} ${st.d ? "not done" : "done"}`}
@@ -474,6 +471,7 @@ export default function GymTracker() {
                               {st.d ? "✓" : ""}
                             </button>
                             <div className="mono" style={{ fontSize: 11, color: "#8a8a82", width: 32, flex: "none" }}>Set {j + 1}</div>
+                            <div style={{ flex: 1, minWidth: 4 }} />
                             <div className="mono" style={{ width: 52, flex: "none", textAlign: "right", fontSize: 19, fontWeight: 700, letterSpacing: "-.01em" }}>{st.w}</div>
                             <div style={{ fontSize: 11, color: "#8a8a82", width: 14, flex: "none", marginLeft: -4 }}>kg</div>
                             <Spinner label={`weight of set ${j + 1}`} onUp={() => adjustWeight(i, j, 2.5)} onDown={() => adjustWeight(i, j, -2.5)} />
@@ -533,14 +531,20 @@ export default function GymTracker() {
                 const color = PLAN_COLOR[g.key];
                 const group = state.records.filter((r) => r.plan === g.key);
                 if (!group.length) return null;
+                /* records arrive most-recently-updated first, so the head of the
+                 * list is the lifts currently being worked on. */
+                const expanded = showAll[g.key] ?? false;
+                const shown = expanded ? group : group.slice(0, TOP_RECORDS);
+                const hidden = group.length - shown.length;
                 return (
                   <div key={g.key}>
                     <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{ width: 9, height: 9, borderRadius: "50%", background: color }} />
                       <span className="klabel" style={{ color }}>{g.label}</span>
+                      <span className="mono" style={{ fontSize: 10.5, color: "#c3c1b8" }}>{group.length}</span>
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", marginTop: 2 }}>
-                      {group.map((r) => {
+                      {shown.map((r) => {
                         const open = state.openRecord === r.name;
                         const hist = r.hist.length ? r.hist : [r.kg];
                         const mx = Math.max(...hist), mn = Math.min(...hist), rng = mx - mn || 1;
@@ -576,6 +580,14 @@ export default function GymTracker() {
                         );
                       })}
                     </div>
+                    {(hidden > 0 || expanded) && (
+                      <button
+                        onClick={() => setShowAll((s) => ({ ...s, [g.key]: !expanded }))}
+                        style={{ marginTop: 10, padding: 0, border: "none", background: "none", font: "600 12px var(--font-hanken)", color: "#8a8a82", cursor: "pointer" }}
+                      >
+                        {expanded ? "Show less" : `Show ${hidden} more`}
+                      </button>
+                    )}
                   </div>
                 );
               })}
@@ -729,15 +741,31 @@ export default function GymTracker() {
                   <div style={{ alignSelf: "center", maxWidth: "90%", background: "#fdecec", color: "#8f2d2d", padding: "10px 14px", borderRadius: 12, fontSize: 12.5, lineHeight: 1.45 }}>{error}</div>
                 )}
               </div>
-              <div style={{ flex: "none", padding: "12px 18px 16px", borderTop: "1px solid rgba(0,0,0,.08)", display: "flex", gap: 10, alignItems: "center" }}>
-                <input
+              {/* alignItems flex-end so the send button stays pinned to the bottom
+                  of the composer as the textarea grows upward. */}
+              <div style={{ flex: "none", padding: "12px 18px 16px", borderTop: "1px solid rgba(0,0,0,.08)", display: "flex", gap: 10, alignItems: "flex-end" }}>
+                <textarea
+                  ref={draftRef}
                   value={state.draft}
-                  onInput={(e) => setState({ draft: (e.target as HTMLInputElement).value })}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !state.thinking) send(); }}
+                  rows={1}
+                  onInput={(e) => setState({ draft: (e.currentTarget as HTMLTextAreaElement).value })}
+                  /* Enter sends, Shift+Enter breaks the line — the chat convention.
+                     A plain Enter must not also insert the newline it just sent on. */
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      if (!state.thinking) send();
+                    }
+                  }}
                   placeholder="Ask for anything — “make today easier”, “plan my week”…"
                   /* 16px, not 14 — iOS Safari auto-zooms the page on focus for anything
                      smaller, and we can't lock that out with maximumScale (see layout.tsx). */
-                  style={{ flex: 1, minWidth: 0, border: "1px solid #dcdad3", borderRadius: 22, padding: "11px 16px", font: "400 16px var(--font-hanken)", background: "#fff", outline: "none" }}
+                  style={{
+                    flex: 1, minWidth: 0, border: "1px solid #dcdad3", borderRadius: 22,
+                    padding: "11px 16px", font: "400 16px var(--font-hanken)", lineHeight: 1.35,
+                    background: "#fff", outline: "none", resize: "none", overflowY: "auto",
+                    maxHeight: DRAFT_MAX_HEIGHT, display: "block",
+                  }}
                 />
                 <button onClick={send} disabled={state.thinking || !state.draft.trim()} style={{ width: 44, height: 44, borderRadius: "50%", background: state.thinking || !state.draft.trim() ? "#c3c1b8" : "#12120f", color: "#fff", border: "none", fontSize: 18, cursor: state.thinking ? "default" : "pointer", flex: "none" }}>↑</button>
               </div>

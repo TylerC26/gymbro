@@ -60,8 +60,6 @@ export interface State extends PersistedState {
   modalPlan: string | null;
   dragY: number;
   dragging: boolean;
-  timerSec: number;
-  timerRunning: boolean;
   /** A coach turn is in flight (MiniMax is thinking / calling tools). */
   thinking: boolean;
 }

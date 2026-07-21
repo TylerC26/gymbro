@@ -55,7 +55,7 @@ of training.
 
 ## Tabs
 
-- **Today** — the session scheduled for the current date, with an inline stopwatch.
+- **Today** — the session scheduled for the current date.
   Expand an exercise to step weight (±2.5 kg) and reps, and tick sets off.
   **Finish Workout** hands the session to the coach, which logs it and writes the breakdown.
 - **Progress** — month totals computed from logged sets, a body-weight trend from

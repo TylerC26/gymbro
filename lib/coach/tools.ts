@@ -589,6 +589,7 @@ export const EXECUTORS: Record<string, Executor> = {
 
     const i = matchIndex(ctx.state.records.map((r) => r.name), name);
     let summary: string;
+    let touched: RecordItem;
     if (i >= 0) {
       const r = ctx.state.records[i];
       const old = r.kg;
@@ -597,12 +598,17 @@ export const EXECUTORS: Record<string, Executor> = {
       if (note) r.note = note;
       if (plan && ["push", "pull", "legs"].includes(plan)) r.plan = plan;
       summary = `${r.name} record ${old} → ${r.kg} kg`;
+      ctx.state.records.splice(i, 1);
+      touched = r;
     } else {
       if (!plan || !["push", "pull", "legs"].includes(plan)) throw new Error(`"${name}" is a new record — pass plan as push, pull or legs.`);
-      const created: RecordItem = { name, plan, kg: round(kg), hist: [round(kg)], note: note ?? "" };
-      ctx.state.records.push(created);
-      summary = `new ${name} record at ${created.kg} kg`;
+      touched = { name, plan, kg: round(kg), hist: [round(kg)], note: note ?? "" };
+      summary = `new ${name} record at ${touched.kg} kg`;
     }
+    /* Front of the list = most recently touched. saveRecords renumbers position
+     * from array order, so this is what makes the Progress tab surface the lifts
+     * you are actually working on — there is no updated_at to sort by. */
+    ctx.state.records.unshift(touched);
     await saveRecords(ctx.supabase, ctx.userId, ctx.state.records);
     return summary;
   },
