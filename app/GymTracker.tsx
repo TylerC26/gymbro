@@ -13,7 +13,7 @@ import {
   todayISO,
   toISO,
 } from "@/lib/types";
-import { ensureUserId, getAccessToken, getSupabase, isSupabaseConfigured } from "@/lib/supabaseClient";
+import { currentUserId, getAccessToken, getSupabase, isSupabaseConfigured, signIn, signOut } from "@/lib/supabaseClient";
 import { loadState, saveSession } from "@/lib/db";
 
 const STORAGE_KEY = "gymbro-state-v2";
@@ -37,6 +37,12 @@ const EMPTY: State = {
 };
 
 const hairline: CSSProperties = { height: 1, background: "rgba(0,0,0,.09)" };
+
+/* 16px, like the coach composer — iOS zooms the page for anything smaller. */
+const loginField: CSSProperties = {
+  width: "100%", border: "1px solid #dcdad3", borderRadius: 12,
+  padding: "13px 15px", font: "400 16px var(--font-hanken)", background: "#fff", outline: "none",
+};
 
 /* Set-row spinner: ▲/▼ stacked in one pill, so a row stays the same width
  * whatever the value is (60 vs 62.5 must not shift anything). */
@@ -93,45 +99,78 @@ export default function GymTracker() {
     [setState, today],
   );
 
-  // Hydrate once on mount: sign in anonymously and load whatever rows exist.
+  const [signedIn, setSignedIn] = useState(false);
+  const [login, setLogin] = useState({ who: "", pw: "", busy: false });
+
+  /** Load the athlete's log — on mount when a session already exists, and
+   *  again the moment they sign in. */
+  const hydrate = useCallback(
+    async (uid: string) => {
+      const supabase = getSupabase();
+      if (!supabase) return;
+      userIdRef.current = uid;
+      setSignedIn(true);
+      try {
+        adoptPersisted(await loadState(supabase, uid));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not reach your training log.");
+      }
+      hydratedRef.current = true;
+    },
+    [adoptPersisted],
+  );
+
+  // On mount: resume a valid session, otherwise fall through to the login screen.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       if (isSupabaseConfigured) {
-        const uid = await ensureUserId();
-        const supabase = getSupabase();
-        if (uid && supabase && !cancelled) {
-          userIdRef.current = uid;
-          try {
-            const data = await loadState(supabase, uid);
-            if (!cancelled) adoptPersisted(data);
-          } catch (e) {
-            if (!cancelled) setError(e instanceof Error ? e.message : "Could not reach your training log.");
-          }
-        } else if (!cancelled) {
-          loadLocal();
-        }
+        const uid = await currentUserId();
+        if (uid && !cancelled) await hydrate(uid);
       } else if (!cancelled) {
-        loadLocal();
-      }
-      if (!cancelled) {
+        /* Local-only mode has no account to sign in to, so there is nothing to
+         * gate: read the cache and go straight through to the app. */
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) adoptPersisted(JSON.parse(raw) as PersistedState);
+        } catch {
+          /* A corrupt cache is just an empty log; the athlete can plan from here. */
+        }
         hydratedRef.current = true;
-        setReady(true);
+        setSignedIn(true);
       }
+      if (!cancelled) setReady(true);
     })();
-
-    function loadLocal() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) adoptPersisted(JSON.parse(raw) as PersistedState);
-      } catch {
-        /* A corrupt cache is just an empty log; the athlete can plan from here. */
-      }
-    }
 
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const submitLogin = async () => {
+    if (login.busy || !login.who.trim() || !login.pw) return;
+    setLogin((l) => ({ ...l, busy: true }));
+    setError(null);
+    const problem = await signIn(login.who, login.pw);
+    if (problem) {
+      setError(problem);
+      setLogin((l) => ({ ...l, pw: "", busy: false }));
+      return;
+    }
+    const uid = await currentUserId();
+    if (uid) await hydrate(uid);
+    setLogin({ who: "", pw: "", busy: false });
+  };
+
+  const endSession = async () => {
+    /* Drop the hydrated flag first: clearing state would otherwise read as an
+     * edit, and the debounced writer would wipe today's session on the way out. */
+    hydratedRef.current = false;
+    userIdRef.current = null;
+    window.clearTimeout(saveTimer.current);
+    await signOut();
+    setS(EMPTY);
+    setSignedIn(false);
+  };
 
   /* ---- derived views over the one source of truth: `sessions` ---- */
   const todaySession = useMemo(() => state.sessions.find((s) => s.date === today) ?? null, [state.sessions, today]);
@@ -302,6 +341,61 @@ export default function GymTracker() {
       <div className="app">
         <div className="body" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div className="klabel">Loading your log…</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!signedIn) {
+    const canSubmit = !login.busy && Boolean(login.who.trim()) && Boolean(login.pw);
+    return (
+      <div className="app">
+        <div className="body" style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "0 26px" }}>
+          <div style={{ width: "100%", maxWidth: 340 }}>
+            <div className="klabel">Gym Tracker</div>
+            <h1 style={{ margin: "8px 0 6px", fontSize: 34, fontWeight: 800, letterSpacing: "-.02em", lineHeight: 1 }}>
+              Welcome back
+            </h1>
+            <div style={{ fontSize: 14, color: "#6b6b64", marginBottom: 24 }}>Sign in to open your training log.</div>
+
+            <input
+              value={login.who}
+              onInput={(e) => setLogin((l) => ({ ...l, who: (e.target as HTMLInputElement).value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") submitLogin(); }}
+              placeholder="Name"
+              autoComplete="username"
+              autoCapitalize="none"
+              autoCorrect="off"
+              style={loginField}
+            />
+            <input
+              value={login.pw}
+              onInput={(e) => setLogin((l) => ({ ...l, pw: (e.target as HTMLInputElement).value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") submitLogin(); }}
+              placeholder="Password"
+              type="password"
+              autoComplete="current-password"
+              style={{ ...loginField, marginTop: 10 }}
+            />
+
+            {error && (
+              <div style={{ marginTop: 12, padding: "10px 13px", borderRadius: 12, background: "#fdecec", color: "#8f2d2d", fontSize: 12.5, lineHeight: 1.45 }}>
+                {error}
+              </div>
+            )}
+
+            <button
+              onClick={submitLogin}
+              disabled={!canSubmit}
+              style={{
+                width: "100%", height: 46, marginTop: 16, borderRadius: 23, border: "none",
+                background: canSubmit ? "#12120f" : "#c3c1b8", color: "#fff",
+                font: "600 15px var(--font-hanken)", cursor: login.busy ? "default" : "pointer",
+              }}
+            >
+              {login.busy ? "Signing in…" : "Sign in"}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -506,6 +600,18 @@ export default function GymTracker() {
                 <div className="strp" style={{ flex: 1, aspectRatio: "3/4", borderRadius: 14, display: "flex", alignItems: "flex-end", padding: 8 }}><span className="mono" style={{ fontSize: 9, color: "#8a8a82" }}>Jul 1</span></div>
                 <div style={{ flex: 1, aspectRatio: "3/4", borderRadius: 14, border: "2px dashed #cdcbc3", display: "flex", alignItems: "center", justifyContent: "center", color: "#b4b2aa", fontSize: 26 }}>+</div>
               </div>
+
+              {isSupabaseConfigured && (
+                <>
+                  <div style={{ ...hairline, marginTop: 30 }} />
+                  <button
+                    onClick={endSession}
+                    style={{ marginTop: 18, height: 40, padding: "0 18px", borderRadius: 20, border: "1px solid #dcdad3", background: "none", font: "600 13px var(--font-hanken)", color: "#6b6b64", cursor: "pointer" }}
+                  >
+                    Sign out
+                  </button>
+                </>
+              )}
             </div>
           )}
 

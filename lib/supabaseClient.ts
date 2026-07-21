@@ -25,21 +25,54 @@ export function getSupabase(): SupabaseClient | null {
   return client;
 }
 
-/** Ensure there's a signed-in user, creating an anonymous one on first visit.
- *  Returns the user id, or null if Supabase isn't configured / sign-in fails. */
-export async function ensureUserId(): Promise<string | null> {
+/* One athlete owns this app. Signing in with a real account rather than an
+ * anonymous per-device one is what lets the same log open on a phone and a
+ * laptop — an anonymous session lives in one browser's storage and nowhere
+ * else. "Tyler" is kinder to type on a phone than an email address, so the
+ * form accepts either and resolves the short name to the account. */
+const ACCOUNT_EMAIL = "tylercklok@gmail.com";
+export const resolveLogin = (who: string) => {
+  const v = who.trim();
+  return v.includes("@") ? v : ACCOUNT_EMAIL;
+};
+
+/** The signed-in athlete's id, or null when nobody is signed in.
+ *  A session whose user no longer exists counts as signed out. */
+export async function currentUserId(): Promise<string | null> {
   const supabase = getSupabase();
   if (!supabase) return null;
 
   const { data: sessionData } = await supabase.auth.getSession();
-  if (sessionData.session?.user) return sessionData.session.user.id;
+  if (!sessionData.session) return null;
 
-  const { data, error } = await supabase.auth.signInAnonymously();
-  if (error) {
-    console.error("Anonymous sign-in failed:", error.message);
+  /* getSession only reads local storage; getUser checks the token is still
+   * good, so a stale or revoked session lands on the login screen instead of
+   * failing later with an opaque error mid-render. */
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) {
+    await supabase.auth.signOut();
     return null;
   }
-  return data.user?.id ?? null;
+  return data.user.id;
+}
+
+/** Sign in. Resolves to null on success, or a message to show the athlete. */
+export async function signIn(who: string, password: string): Promise<string | null> {
+  const supabase = getSupabase();
+  if (!supabase) return "The training log isn't configured on this device.";
+
+  const { error } = await supabase.auth.signInWithPassword({
+    email: resolveLogin(who),
+    password,
+  });
+  if (!error) return null;
+  /* Supabase says "Invalid login credentials" for both a wrong name and a
+   * wrong password, which is the right thing to leak — pass it through. */
+  return error.message;
+}
+
+export async function signOut(): Promise<void> {
+  await getSupabase()?.auth.signOut();
 }
 
 /** The JWT the coach API route uses to act as this athlete under RLS. */
