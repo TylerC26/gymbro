@@ -339,14 +339,7 @@ export default function GymTracker() {
    * Render
    * ================================================================ */
   return (
-    <div className="phone">
-      <div className="screen">
-        <div className="notch" />
-        <div className="sbar">
-          <span>9:41</span>
-          <StatusIcons />
-        </div>
-
+    <div className="app">
         <div className="body">
           {/* ===================== TODAY ===================== */}
           {state.tab === "today" && (
@@ -626,33 +619,7 @@ export default function GymTracker() {
             <svg className="ic" viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z" /></svg>Coach
           </button>
         </div>
-      </div>
     </div>
   );
 }
 
-/* ------------------------------------------------------------------ *
- * Cross-platform status-bar glyphs (the source used SF Symbols)
- * ------------------------------------------------------------------ */
-function StatusIcons() {
-  return (
-    <span style={{ display: "flex", gap: 7, alignItems: "center" }}>
-      <svg width="18" height="12" viewBox="0 0 18 12" fill="#12120f" aria-hidden>
-        <rect x="0" y="8" width="3" height="4" rx="1" />
-        <rect x="5" y="5" width="3" height="7" rx="1" />
-        <rect x="10" y="2.5" width="3" height="9.5" rx="1" />
-        <rect x="15" y="0" width="3" height="12" rx="1" />
-      </svg>
-      <svg width="16" height="12" viewBox="0 0 16 12" fill="none" stroke="#12120f" strokeWidth="1.6" strokeLinecap="round" aria-hidden>
-        <path d="M1 4.4 A10 10 0 0 1 15 4.4" />
-        <path d="M3.6 6.9 A6.2 6.2 0 0 1 12.4 6.9" />
-        <circle cx="8" cy="9.8" r="1" fill="#12120f" stroke="none" />
-      </svg>
-      <svg width="25" height="12" viewBox="0 0 25 12" fill="none" aria-hidden>
-        <rect x="0.5" y="1" width="20" height="10" rx="2.5" stroke="#12120f" strokeOpacity="0.4" />
-        <rect x="2" y="2.5" width="15" height="7" rx="1.5" fill="#12120f" />
-        <path d="M22.5 4 v4" stroke="#12120f" strokeOpacity="0.4" strokeWidth="1.8" strokeLinecap="round" />
-      </svg>
-    </span>
-  );
-}
