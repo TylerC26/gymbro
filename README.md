@@ -35,6 +35,7 @@ browser  ◀── re-renders every tab from the returned state
 | Tool | Effect |
 | --- | --- |
 | `update_session` | Create/rewrite any calendar day: title, split, exercises, notes, completed |
+| `schedule_block` | Write a whole multi-week program at once, with per-week load progression |
 | `delete_session` | Clear a day |
 | `add_exercise` / `remove_exercise` / `update_exercise` | Edit one lift (absolute or `+2.5 kg`-style deltas) |
 | `mark_sets` | Tick sets or a whole session off as trained |
@@ -43,7 +44,14 @@ browser  ◀── re-renders every tab from the returned state
 | `remember` / `forget` | Durable facts about the athlete |
 
 Try: *"make today easier, my shoulder is sore"*, *"plan my week around 4 sessions"*,
-*"move leg day to Friday"*, *"I hit 125 on deadlift"*, *"I weigh 77.5 today"*.
+*"move leg day to Friday"*, *"I hit 125 on deadlift"*, *"I weigh 77.5 today"*,
+*"program my next 6 weeks"*.
+
+A day or two is written a day at a time; anything spanning weeks goes through
+`schedule_block` in a single call, because the tool-calling loop stops at 6
+rounds. If a block would land on days that already hold sessions it writes
+nothing and reports the clash, so the coach has to ask before replacing a month
+of training.
 
 ## Tabs
 

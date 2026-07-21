@@ -1,7 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Exercise, LiftPlan, PersistedState, Plan, RecordItem, Session } from "../types";
 import { shiftISO } from "../types";
-import { deleteMemory, deleteSession, logBodyWeight, saveRecords, saveSession, setMemory } from "../db";
+import { deleteMemory, deleteSession, logBodyWeight, saveRecords, saveSession, saveSessions, setMemory } from "../db";
 import type { ToolDef } from "../minimax";
 
 /* The coach's hands. Every tool writes through the athlete's own RLS-scoped
@@ -160,6 +160,60 @@ export const TOOLS: ToolDef[] = [
           },
         },
         required: ["date"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "schedule_block",
+      description:
+        "Write a whole multi-week training block onto the calendar in one call. Use this whenever the athlete asks for a program, a block, or 'plan my next N weeks' — writing those days one at a time with update_session runs out of tool calls before the block is finished. `pattern` is ONE week of the cycle and repeats for `weeks` weeks.",
+      parameters: {
+        type: "object",
+        properties: {
+          start_date: { type: "string", description: "YYYY-MM-DD, or 'today'/'tomorrow'. The block's first day." },
+          weeks: { type: "number", description: "How many times to repeat the pattern. 1–12." },
+          pattern: {
+            type: "array",
+            description:
+              "One week of the cycle, in order from start_date. Include the rest days too, so the rotation keeps lining up week after week.",
+            items: {
+              type: "object",
+              properties: {
+                plan: { type: "string", enum: ["push", "pull", "legs", "rest"] },
+                title: { type: "string", description: "Defaults to the split's usual name." },
+                groups: { type: "string", description: "Muscle groups subtitle." },
+                notes: { type: "string" },
+                exercises: {
+                  type: "array",
+                  description: "Omit or leave empty on rest days.",
+                  items: {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      sets: { type: "number" },
+                      reps: { type: "number" },
+                      weight_kg: { type: "number", description: "Load in week 1." },
+                      weekly_increment_kg: {
+                        type: "number",
+                        description: "Added to the load each week — typically 2.5 on upper compounds, 5 on lower, 0 for accessories.",
+                      },
+                    },
+                    required: ["name"],
+                  },
+                },
+              },
+              required: ["plan"],
+            },
+          },
+          overwrite: {
+            type: "boolean",
+            description:
+              "Default false. If any day in the range already has a session, the call writes NOTHING and tells you which days clash — ask the athlete before calling again with true.",
+          },
+        },
+        required: ["start_date", "weeks", "pattern"],
       },
     },
   },
@@ -346,6 +400,75 @@ export const EXECUTORS: Record<string, Executor> = {
 
     await persist(ctx, session);
     return `${dayName(ctx, date)}: ${session.title}${changes.length ? ` (${changes.join(", ")})` : ""}`;
+  },
+
+  async schedule_block(a, ctx) {
+    const start = resolveDate(ctx, str(a, "start_date"));
+    const weeks = clamp(Math.round(nml(a, "weeks") ?? 4), 1, 12);
+
+    const cycle = (Array.isArray(a.pattern) ? a.pattern : []).filter(
+      (d): d is Args => Boolean(d) && typeof d === "object",
+    );
+    if (!cycle.length) throw new Error("`pattern` needs at least one day — one week of the cycle to repeat.");
+
+    const dates = Array.from({ length: weeks * cycle.length }, (_, i) => shiftISO(start, i));
+
+    /* ctx.state already holds every session the athlete has, so the clash check
+     * costs no round trip. Refusing here — rather than trusting a prompt rule —
+     * is what stops a new block from quietly flattening real logged history. */
+    if (!bool(a, "overwrite")) {
+      const clashes = dates.filter((d) => getSession(ctx, d));
+      if (clashes.length) {
+        const shown = clashes.slice(0, 5).join(", ");
+        throw new Error(
+          `${clashes.length} day(s) in that range already have sessions (${shown}${clashes.length > 5 ? "…" : ""}). ` +
+            "Tell the athlete what would be replaced and get a yes, then call again with overwrite: true.",
+        );
+      }
+    }
+
+    const sessions: Session[] = dates.map((date, i) => {
+      const day = cycle[i % cycle.length];
+      const week = Math.floor(i / cycle.length);
+      const exRaw = Array.isArray(day.exercises) ? day.exercises : [];
+      /* A day with lifts but no split is a training day, not a rest day —
+       * defaulting to "rest" here would silently throw its exercises away. */
+      const plan = requirePlan(str(day, "plan")) ?? (exRaw.length ? "push" : "rest");
+      return {
+        date,
+        plan,
+        title: str(day, "title") ?? PLAN_DEFAULTS[plan].title,
+        groups: str(day, "groups") ?? PLAN_DEFAULTS[plan].groups,
+        notes: str(day, "notes") ?? "",
+        completed: false,
+        exercises:
+          plan === "rest"
+            ? []
+            : exRaw
+                .filter((e): e is Args => Boolean(e) && typeof e === "object")
+                .map((e) => ({
+                  name: String(e.name ?? "").trim(),
+                  /* Week 1 load plus the per-week step; buildSets rounds to 0.5 kg. */
+                  sets: buildSets(
+                    nml(e, "sets") ?? 3,
+                    nml(e, "reps") ?? 10,
+                    (nml(e, "weight_kg") ?? 20) + (nml(e, "weekly_increment_kg") ?? 0) * week,
+                  ),
+                }))
+                .filter((e) => e.name),
+      };
+    });
+
+    await saveSessions(ctx.supabase, ctx.userId, sessions);
+
+    /* Keep the working copy in step so later tools this turn see the new block. */
+    const written = new Set(dates);
+    ctx.state.sessions = [...ctx.state.sessions.filter((s) => !written.has(s.date)), ...sessions].sort((x, y) =>
+      x.date.localeCompare(y.date),
+    );
+
+    const trained = sessions.filter((s) => s.exercises.length).length;
+    return `scheduled ${weeks} week${weeks === 1 ? "" : "s"} from ${dayName(ctx, start)} — ${trained} training day${trained === 1 ? "" : "s"}, ${dates.length - trained} rest`;
   },
 
   async delete_session(a, ctx) {

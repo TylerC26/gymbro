@@ -198,3 +198,71 @@ export async function deleteMemory(s: SupabaseClient, userId: string, key: strin
 }
 
 /* No seeding: a new athlete's log starts empty and fills up as they train. */
+
+/* ------------------------------------------------------------ bulk sessions */
+
+/** Write many dated sessions at once — three round trips for the whole block
+ *  instead of three per day. Looping saveSession over a month of training is
+ *  what would otherwise blow the coach's tool-call budget. Replaces each target
+ *  date wholesale, so it stays idempotent exactly like saveSession. */
+export async function saveSessions(s: SupabaseClient, userId: string, sessions: Session[]) {
+  if (!sessions.length) return;
+
+  const { error: delErr } = await s
+    .from("workouts")
+    .delete()
+    .eq("user_id", userId)
+    .in("scheduled_date", sessions.map((p) => p.date));
+  if (delErr) throw new Error(delErr.message);
+
+  const { data: wIns, error } = await s
+    .from("workouts")
+    .insert(
+      sessions.map((p, i) => ({
+        user_id: userId,
+        kind: "session",
+        scheduled_date: p.date,
+        title: p.title,
+        subtitle: p.groups,
+        plan: p.plan,
+        completed: p.completed,
+        notes: p.notes,
+        color: "",
+        date_label: "",
+        position: i,
+      })),
+    )
+    .select("id,position");
+  if (error) throw new Error(error.message);
+
+  const workoutIdByPos = new Map((wIns ?? []).map((r) => [r.position, r.id]));
+  const exRows: Record<string, unknown>[] = [];
+  sessions.forEach((p, i) => {
+    const wid = workoutIdByPos.get(i);
+    if (!wid) return;
+    p.exercises.forEach((e, j) => exRows.push({ workout_id: wid, user_id: userId, name: e.name, scheme: "", position: j }));
+  });
+  if (!exRows.length) return;
+
+  const { data: exIns, error: exErr } = await s.from("workout_exercises").insert(exRows).select("id,workout_id,position");
+  if (exErr) throw new Error(exErr.message);
+
+  const exIdByKey = new Map((exIns ?? []).map((r) => [`${r.workout_id}:${r.position}`, r.id]));
+  const setRows: Record<string, unknown>[] = [];
+  sessions.forEach((p, i) => {
+    const wid = workoutIdByPos.get(i);
+    if (!wid) return;
+    p.exercises.forEach((e, j) => {
+      const exId = exIdByKey.get(`${wid}:${j}`);
+      if (!exId) return;
+      e.sets.forEach((st, k) =>
+        setRows.push({ exercise_id: exId, user_id: userId, position: k, weight_kg: st.w, reps: st.r, done: st.d }),
+      );
+    });
+  });
+
+  if (setRows.length) {
+    const { error: setErr } = await s.from("exercise_sets").insert(setRows);
+    if (setErr) throw new Error(setErr.message);
+  }
+}

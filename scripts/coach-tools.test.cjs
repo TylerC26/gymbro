@@ -16,6 +16,7 @@ function fakeClient() {
       delete() { calls.push({ table, op: "delete" }); return this; },
       select() { return this; },
       eq() { return this; }, gte() { return this; }, lte() { return this; }, order() { return this; },
+      in(col, values) { calls.push({ table, op: "in", col, values }); return this; },
       single() { return Promise.resolve({ data: { id: `${table}-1` }, error: null }); },
       then(res, rej) {
         const data = (this._rows ?? []).map((r, i) => ({ id: `${table}-${i}`, position: r.position ?? i, workout_id: r.workout_id }));
@@ -140,6 +141,58 @@ async function expectThrow(label, fn, match) {
   check("remember normalises the key", ctx.state.memory.training_days === "Mon/Tue/Thu/Fri", msg);
   await run("forget", { key: "training_days" }, ctx);
   check("forget removes it", !("training_days" in ctx.state.memory));
+
+  /* ---- multi-week blocks ---- */
+  ctx = newCtx();
+  const blockStart = shiftISO(today, 30); // clear of the seeded month
+  const week = [
+    { plan: "push", exercises: [{ name: "Bench Press", sets: 4, reps: 6, weight_kg: 50, weekly_increment_kg: 2.5 }] },
+    { plan: "pull", exercises: [{ name: "Barbell Row", sets: 4, reps: 8, weight_kg: 50 }] },
+    { plan: "rest" },
+    { plan: "legs", exercises: [{ name: "Back Squat", sets: 4, reps: 5, weight_kg: 80, weekly_increment_kg: 5 }] },
+    { plan: "rest" },
+    { plan: "push", exercises: [{ name: "Overhead Press", sets: 4, reps: 6, weight_kg: 30, weekly_increment_kg: 2.5 }] },
+    { plan: "rest" },
+  ];
+  msg = await run("schedule_block", { start_date: blockStart, weeks: 4, pattern: week }, ctx);
+  const block = ctx.state.sessions.filter((s) => s.date >= blockStart);
+  check("schedule_block writes every day of the block", block.length === 28, msg);
+  check("the whole block is one bulk insert, not one per day",
+    ctx.supabase._calls.filter((c) => c.table === "workouts" && c.op === "insert").length === 1);
+
+  const wk1 = block.find((s) => s.date === blockStart).exercises[0];
+  const wk4 = block.find((s) => s.date === shiftISO(blockStart, 21)).exercises[0];
+  check("weekly_increment_kg progresses the load each week", wk1.sets[0].w === 50 && wk4.sets[0].w === 57.5,
+    `${wk1.sets[0].w} → ${wk4.sets[0].w} kg`);
+  const flat = block.find((s) => s.date === shiftISO(blockStart, 22)).exercises[0];
+  check("no increment leaves the load flat", flat.sets[0].w === 50, `${flat.name} ${flat.sets[0].w} kg in week 4`);
+  check("rest days carry no exercises", block.filter((s) => s.plan === "rest").every((s) => s.exercises.length === 0),
+    `${block.filter((s) => s.plan === "rest").length} rest days`);
+  check("the rotation holds across weeks", block[0].plan === "push" && block[7].plan === "push" && block[9].plan === "rest");
+
+  /* A block landing on days that already exist must refuse — and write nothing. */
+  ctx = newCtx();
+  await expectThrow("schedule_block refuses to overwrite existing days",
+    () => run("schedule_block", { start_date: today, weeks: 2, pattern: week }, ctx), /already have sessions/);
+  check("a refused block writes nothing at all",
+    !ctx.supabase._calls.some((c) => c.table === "workouts" && c.op === "insert"));
+
+  msg = await run("schedule_block", { start_date: today, weeks: 1, pattern: week, overwrite: true }, ctx);
+  check("overwrite: true replaces the clashing days", sessionOn(ctx, today).exercises[0].name === "Bench Press", msg);
+  check("overwriting replaces rather than duplicates", ctx.state.sessions.filter((s) => s.date === today).length === 1);
+
+  await expectThrow("an empty pattern is rejected",
+    () => run("schedule_block", { start_date: blockStart, weeks: 2, pattern: [] }, newCtx()), /at least one day/);
+
+  /* A day carrying lifts but no split must not be silently emptied as a rest day. */
+  ctx = newCtx();
+  await run("schedule_block", {
+    start_date: blockStart, weeks: 1,
+    pattern: [{ exercises: [{ name: "Hip Thrust", sets: 3, reps: 10, weight_kg: 45 }] }, { plan: "rest" }],
+  }, ctx);
+  const untitled = ctx.state.sessions.find((s) => s.date === blockStart);
+  check("a day with lifts but no split keeps them", untitled.plan === "push" && untitled.exercises.length === 1,
+    `${untitled.plan}, ${untitled.exercises.length} exercise(s)`);
 
   /* ---- context fed to the model ---- */
   ctx = newCtx();
