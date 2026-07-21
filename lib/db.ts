@@ -153,7 +153,7 @@ export async function saveRecords(s: SupabaseClient, userId: string, records: Re
  *  positions stay dense and ordered. */
 export async function appendMessages(s: SupabaseClient, userId: string, messages: Message[], startPos: number) {
   if (!messages.length) return;
-  await s.from("coach_messages").insert(
+  const { error } = await s.from("coach_messages").insert(
     messages.map((m, i) => ({
       user_id: userId,
       sender: m.from,
@@ -162,6 +162,7 @@ export async function appendMessages(s: SupabaseClient, userId: string, messages
       position: startPos + i,
     })),
   );
+  if (error) throw new Error(`could not save the transcript: ${error.message}`);
 }
 
 /* ------------------------------------------------------------ body weight */
