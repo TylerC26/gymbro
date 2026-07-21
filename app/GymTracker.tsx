@@ -1,57 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-
-/* ------------------------------------------------------------------ *
- * Types
- * ------------------------------------------------------------------ */
-type Tab = "today" | "progress" | "calendar" | "coach";
-type Plan = "push" | "pull" | "legs";
-
-interface SetEntry {
-  w: number;
-  r: number;
-  d: boolean;
-}
-interface Exercise {
-  name: string;
-  sets: SetEntry[];
-}
-interface RecordItem {
-  name: string;
-  plan: Plan;
-  kg: number;
-  hist: number[];
-  note: string;
-}
-interface Session {
-  date: string;
-  title: string;
-  groups: string;
-  color: string;
-  ex: [string, string][];
-}
-interface Message {
-  from: "coach" | "user";
-  text: string;
-}
-interface State {
-  tab: Tab;
-  openEx: number;
-  openRecord: string | null;
-  bodyWeight: number;
-  bodyWeightChange: number;
-  records: RecordItem[];
-  workout: Exercise[];
-  draft: string;
-  modalPlan: number | null;
-  dragY: number;
-  dragging: boolean;
-  plans: Session[];
-  timerSec: number;
-  timerRunning: boolean;
-  messages: Message[];
-}
+import type { Exercise, Plan, State } from "@/lib/types";
+import { ensureUserId, isSupabaseConfigured } from "@/lib/supabaseClient";
+import { loadRemoteState, logBodyWeight, saveMessages, saveRecords, saveWorkout, seedRemote } from "@/lib/db";
 
 /* ------------------------------------------------------------------ *
  * Initial data (ported from the design source)
@@ -141,24 +93,78 @@ export default function GymTracker() {
   const setState = (u: Partial<State> | ((s: State) => Partial<State>)) =>
     setS((prev) => ({ ...prev, ...(typeof u === "function" ? u(prev) : u) }));
 
-  /* ---- persistence ---- */
-  useEffect(() => {
+  /* ---- persistence: Supabase (anonymous per-device) w/ localStorage fallback ---- */
+  const userIdRef = useRef<string | null>(null);
+  const hydratedRef = useRef(false);
+  const skipNextSaveRef = useRef(false);
+  const saveTimer = useRef<number | undefined>(undefined);
+
+  const loadLocal = () => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) setState(JSON.parse(raw) as Partial<State>);
     } catch {
       /* ignore corrupt storage */
     }
+  };
+
+  // Hydrate once on mount: sign in anonymously, load rows (seeding a fresh user).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (isSupabaseConfigured) {
+        const uid = await ensureUserId();
+        if (uid && !cancelled) {
+          userIdRef.current = uid;
+          let data = await loadRemoteState(uid);
+          if (!data) {
+            await seedRemote(uid, INITIAL);
+            data = await loadRemoteState(uid);
+          }
+          if (data && !cancelled) {
+            skipNextSaveRef.current = true; // don't immediately re-save what we just loaded
+            setState(data);
+          }
+        } else if (!cancelled) {
+          loadLocal();
+        }
+      } else {
+        loadLocal();
+      }
+      hydratedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Persist mutable state on change (debounced write-through to Supabase, else localStorage).
   useEffect(() => {
-    try {
-      const { workout, records, bodyWeight, bodyWeightChange, messages, plans } = state;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ workout, records, bodyWeight, bodyWeightChange, messages, plans }));
-    } catch {
-      /* storage full / unavailable */
+    if (!hydratedRef.current) return;
+    const uid = userIdRef.current;
+    if (isSupabaseConfigured && uid) {
+      if (skipNextSaveRef.current) {
+        skipNextSaveRef.current = false;
+        return;
+      }
+      const { workout, records, messages } = state;
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        saveWorkout(uid, workout);
+        saveRecords(uid, records);
+        saveMessages(uid, messages);
+      }, 700);
+    } else {
+      try {
+        const { workout, records, bodyWeight, bodyWeightChange, messages, plans } = state;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ workout, records, bodyWeight, bodyWeightChange, messages, plans }));
+      } catch {
+        /* storage full / unavailable */
+      }
     }
-  }, [state.workout, state.records, state.bodyWeight, state.bodyWeightChange, state.messages, state.plans]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.workout, state.records, state.messages, state.bodyWeight, state.bodyWeightChange, state.plans]);
 
   /* ---- timer ---- */
   useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
@@ -260,6 +266,7 @@ export default function GymTracker() {
     if (m) {
       const w = parseFloat(m[1]), prev = state.bodyWeight, diff = +(w - prev).toFixed(1);
       setState({ bodyWeight: w, bodyWeightChange: diff });
+      if (isSupabaseConfigured && userIdRef.current) logBodyWeight(userIdRef.current, w);
       const c = diff < 0 ? "Cut's on track — keep protein ≥1.8 g/kg." : diff > 0 ? "Trending up; fine if you're in a surplus." : "Holding steady.";
       return "Body weight logged: " + w + " kg (" + (diff >= 0 ? "+" : "−") + Math.abs(diff) + " kg vs last). " + c + " It's on your Progress tab.";
     }
