@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "tsc lib/types.ts lib/db.ts lib/seed.ts lib/coach/tools.ts lib/coach/context.ts --module commonjs --moduleResolution node --target ES2020 --outDir build/tooltest --skipLibCheck --esModuleInterop && node scripts/coach-tools.test.cjs",
+    "smoke": "node scripts/smoke-coach.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",

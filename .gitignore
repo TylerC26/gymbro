@@ -29,3 +29,6 @@ next-env.d.ts
 
 # vercel
 .vercel
+
+# supabase cli scratch
+supabase/.temp

@@ -1,170 +1,180 @@
 "use client";
 
-import { useEffect, useRef, useState, type CSSProperties } from "react";
-import type { Exercise, Plan, State } from "@/lib/types";
-import { ensureUserId, isSupabaseConfigured } from "@/lib/supabaseClient";
-import { loadRemoteState, logBodyWeight, saveMessages, saveRecords, saveWorkout, seedRemote } from "@/lib/db";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import type { Exercise, LiftPlan, PersistedState, Session, State } from "@/lib/types";
+import {
+  PLAN_COLOR,
+  fromISO,
+  longLabel,
+  monthLabel,
+  scheme,
+  sessionVolume,
+  shortLabel,
+  todayISO,
+  toISO,
+} from "@/lib/types";
+import { ensureUserId, getAccessToken, getSupabase, isSupabaseConfigured } from "@/lib/supabaseClient";
+import { loadState, saveSession, seedRemote } from "@/lib/db";
+import { buildSeed } from "@/lib/seed";
 
-/* ------------------------------------------------------------------ *
- * Initial data (ported from the design source)
- * ------------------------------------------------------------------ */
-const INITIAL: State = {
+const STORAGE_KEY = "gymbro-state-v2";
+
+const EMPTY: State = {
+  sessions: [],
+  records: [],
+  messages: [],
+  weighIns: [],
+  memory: {},
   tab: "today",
   openEx: 0,
   openRecord: null,
-  bodyWeight: 78.4,
-  bodyWeightChange: -1.2,
-  records: [
-    { name: "Bench Press", plan: "push", kg: 62.5, hist: [57.5, 60, 60, 62.5], note: "Top single. +2.5 kg this block — bar speed still sharp." },
-    { name: "Overhead Press", plan: "push", kg: 45, hist: [42.5, 45, 45, 45], note: "Stalled two sessions. Deload 10% next week." },
-    { name: "Incline DB Press", plan: "push", kg: 24, hist: [20, 22, 22, 24], note: "Per dumbbell." },
-    { name: "Deadlift", plan: "pull", kg: 120, hist: [110, 115, 117.5, 120], note: "Belted over 100 kg. Grip is the limiter." },
-    { name: "Barbell Row", plan: "pull", kg: 60, hist: [52.5, 55, 57.5, 60], note: "Strict, no body english." },
-    { name: "Weighted Pull-Up", plan: "pull", kg: 15, hist: [7.5, 10, 12.5, 15], note: "Added to bodyweight." },
-    { name: "Back Squat", plan: "legs", kg: 95, hist: [85, 90, 90, 95], note: "High bar, below parallel." },
-    { name: "Romanian Deadlift", plan: "legs", kg: 80, hist: [70, 72.5, 77.5, 80], note: "3-second eccentric." },
-    { name: "Leg Press", plan: "legs", kg: 160, hist: [140, 150, 155, 160], note: "Full stack within reach." },
-  ],
-  workout: [
-    { name: "Barbell Bench Press", sets: [{ w: 60, r: 8, d: true }, { w: 60, r: 8, d: true }, { w: 62.5, r: 6, d: true }, { w: 62.5, r: 6, d: true }] },
-    { name: "Incline Dumbbell Press", sets: [{ w: 22, r: 10, d: true }, { w: 22, r: 10, d: true }, { w: 22, r: 9, d: true }, { w: 22, r: 8, d: true }] },
-    { name: "Cable Fly", sets: [{ w: 15, r: 12, d: false }, { w: 15, r: 12, d: false }, { w: 15, r: 12, d: false }] },
-    { name: "Overhead Press", sets: [{ w: 35, r: 8, d: false }, { w: 35, r: 8, d: false }, { w: 35, r: 8, d: false }, { w: 35, r: 8, d: false }] },
-    { name: "Triceps Pushdown", sets: [{ w: 25, r: 15, d: false }, { w: 25, r: 15, d: false }, { w: 25, r: 15, d: false }] },
-  ],
   draft: "",
   modalPlan: null,
   dragY: 0,
   dragging: false,
-  plans: [
-    { date: "TUE 22", title: "Pull Day", groups: "Back · Biceps", color: "oklch(0.7 0.12 165)", ex: [["Deadlift", "4 × 5 · 100 kg"], ["Pull-Up", "4 × 8 · BW"], ["Barbell Row", "4 × 10 · 55 kg"], ["Lat Pulldown", "3 × 12 · 45 kg"], ["Face Pull", "3 × 15 · 20 kg"], ["Barbell Curl", "3 × 12 · 25 kg"]] },
-    { date: "WED 23", title: "Leg Day", groups: "Quads · Hamstrings", color: "oklch(0.72 0.13 55)", ex: [["Back Squat", "4 × 8 · 95 kg"], ["Romanian Deadlift", "4 × 10 · 70 kg"], ["Leg Press", "4 × 12 · 140 kg"], ["Leg Curl", "3 × 12 · 40 kg"], ["Calf Raise", "4 × 15 · 60 kg"]] },
-    { date: "THU 24", title: "Rest", groups: "Recovery day", color: "#d8d6cf", ex: [] },
-  ],
   timerSec: 0,
   timerRunning: false,
-  messages: [
-    { from: "coach", text: "Morning. Your bench is trending up — 62.5 kg last session, a 2.5 kg PR. Want me to push today's top set?" },
-    { from: "user", text: "Yeah let's try 65." },
-    { from: "coach", text: "Good call. Data says you've cleared 4×8 at 60 twice, so 65 for 4×6 is a safe progression. I'll log it in today's plan." },
-  ],
+  thinking: false,
 };
 
-const STORAGE_KEY = "gymbro-state-v1";
-const PLAN_COLOR: Record<Plan, string> = {
-  push: "#3c8cff",
-  pull: "oklch(0.7 0.12 165)",
-  legs: "oklch(0.72 0.13 55)",
-};
-
-/* Calendar day cells for July 2026 (July 1 = Wednesday, Monday-first grid) */
-const TRAINED: Record<number, Plan> = { 1: "push", 2: "pull", 4: "legs", 6: "push", 7: "pull", 9: "legs", 11: "push", 13: "pull", 14: "legs", 16: "push", 18: "pull", 20: "legs" };
-interface DayCell { n: string; today: boolean; color: string; dot: string; weight: number; }
-const DAYS: DayCell[] = (() => {
-  const out: DayCell[] = [];
-  for (let i = 0; i < 2; i++) out.push({ n: "", today: false, color: "transparent", dot: "transparent", weight: 400 });
-  for (let n = 1; n <= 31; n++) {
-    const today = n === 21;
-    const plan = TRAINED[n];
-    out.push({
-      n: String(n),
-      today,
-      color: today ? "#fff" : "#12120f",
-      weight: today ? 700 : 400,
-      dot: today ? "#12120f" : plan ? PLAN_COLOR[plan] : "transparent",
-    });
-  }
-  return out;
-})();
-
-const stepBtn: CSSProperties = { width: 24, height: 24, border: "1px solid #dcdad3", background: "#fff", borderRadius: 7, fontSize: 15, lineHeight: 1, color: "#12120f", cursor: "pointer", flex: "none" };
 const hairline: CSSProperties = { height: 1, background: "rgba(0,0,0,.09)" };
+
+/* Set-row spinner: ▲/▼ stacked in one pill, so a row stays the same width
+ * whatever the value is (60 vs 62.5 must not shift anything). */
+const spinBox: CSSProperties = { display: "flex", flexDirection: "column", width: 22, height: 30, flex: "none", border: "1px solid #dcdad3", borderRadius: 7, background: "#fff", overflow: "hidden" };
+const spinBtn: CSSProperties = { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: "none", padding: 0, fontSize: 7, lineHeight: 1, color: "#12120f", cursor: "pointer" };
+
+function Spinner({ label, onUp, onDown }: { label: string; onUp: () => void; onDown: () => void }) {
+  return (
+    <div style={spinBox}>
+      <button aria-label={`Increase ${label}`} onClick={onUp} style={{ ...spinBtn, borderBottom: "1px solid #e6e4de" }}>▲</button>
+      <button aria-label={`Decrease ${label}`} onClick={onDown} style={spinBtn}>▼</button>
+    </div>
+  );
+}
 
 /* ------------------------------------------------------------------ *
  * Component
  * ------------------------------------------------------------------ */
 export default function GymTracker() {
-  const [state, setS] = useState<State>(INITIAL);
+  const [today] = useState(todayISO);
+  const [state, setS] = useState<State>(EMPTY);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [month, setMonth] = useState(() => `${todayISO().slice(0, 7)}-01`);
+
   const timerRef = useRef<number | null>(null);
   const dy0 = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
 
-  /* setState with DCLogic-style merge semantics */
-  const setState = (u: Partial<State> | ((s: State) => Partial<State>)) =>
-    setS((prev) => ({ ...prev, ...(typeof u === "function" ? u(prev) : u) }));
+  /* setState with merge semantics */
+  const setState = useCallback(
+    (u: Partial<State> | ((s: State) => Partial<State>)) =>
+      setS((prev) => ({ ...prev, ...(typeof u === "function" ? u(prev) : u) })),
+    [],
+  );
 
   /* ---- persistence: Supabase (anonymous per-device) w/ localStorage fallback ---- */
   const userIdRef = useRef<string | null>(null);
   const hydratedRef = useRef(false);
-  const skipNextSaveRef = useRef(false);
+  /* Serialized copy of what the database already holds for today, so a state
+   * replacement coming *from* the server never bounces straight back to it. */
+  const savedTodayRef = useRef<string>("");
   const saveTimer = useRef<number | undefined>(undefined);
 
-  const loadLocal = () => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setState(JSON.parse(raw) as Partial<State>);
-    } catch {
-      /* ignore corrupt storage */
-    }
-  };
+  const adoptPersisted = useCallback(
+    (data: PersistedState) => {
+      /* Server state wins: drop any pending local write so a stale debounce
+       * can't overwrite what the coach just saved. */
+      window.clearTimeout(saveTimer.current);
+      const t = data.sessions.find((s) => s.date === today);
+      savedTodayRef.current = t ? JSON.stringify(t) : "";
+      setState(data);
+    },
+    [setState, today],
+  );
 
   // Hydrate once on mount: sign in anonymously, load rows (seeding a fresh user).
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const seed = buildSeed(today);
       if (isSupabaseConfigured) {
         const uid = await ensureUserId();
-        if (uid && !cancelled) {
+        const supabase = getSupabase();
+        if (uid && supabase && !cancelled) {
           userIdRef.current = uid;
-          let data = await loadRemoteState(uid);
-          if (!data) {
-            await seedRemote(uid, INITIAL);
-            data = await loadRemoteState(uid);
-          }
-          if (data && !cancelled) {
-            skipNextSaveRef.current = true; // don't immediately re-save what we just loaded
-            setState(data);
+          try {
+            let data = await loadState(supabase, uid);
+            if (!data) {
+              await seedRemote(supabase, uid, seed);
+              data = await loadState(supabase, uid);
+            }
+            if (data && !cancelled) adoptPersisted(data);
+          } catch (e) {
+            if (!cancelled) setError(e instanceof Error ? e.message : "Could not reach your training log.");
           }
         } else if (!cancelled) {
-          loadLocal();
+          loadLocal(seed);
         }
-      } else {
-        loadLocal();
+      } else if (!cancelled) {
+        loadLocal(seed);
       }
-      hydratedRef.current = true;
+      if (!cancelled) {
+        hydratedRef.current = true;
+        setReady(true);
+      }
     })();
-    return () => {
-      cancelled = true;
-    };
+
+    function loadLocal(seed: PersistedState) {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        adoptPersisted(raw ? (JSON.parse(raw) as PersistedState) : seed);
+      } catch {
+        adoptPersisted(seed);
+      }
+    }
+
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist mutable state on change (debounced write-through to Supabase, else localStorage).
+  /* ---- derived views over the one source of truth: `sessions` ---- */
+  const todaySession = useMemo(() => state.sessions.find((s) => s.date === today) ?? null, [state.sessions, today]);
+  const workout = todaySession?.exercises ?? [];
+  const upcoming = useMemo(() => state.sessions.filter((s) => s.date > today).slice(0, 6), [state.sessions, today]);
+  const byDate = useMemo(() => new Map(state.sessions.map((s) => [s.date, s])), [state.sessions]);
+
+  // Persist the athlete's own edits to today's session. Coach edits already
+  // went through the server, so those arrive pre-saved and are skipped here.
+  const todayJson = todaySession ? JSON.stringify(todaySession) : "";
   useEffect(() => {
     if (!hydratedRef.current) return;
+    if (todayJson === savedTodayRef.current) return;
+    savedTodayRef.current = todayJson;
+
     const uid = userIdRef.current;
-    if (isSupabaseConfigured && uid) {
-      if (skipNextSaveRef.current) {
-        skipNextSaveRef.current = false;
-        return;
+    const supabase = getSupabase();
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      if (isSupabaseConfigured && uid && supabase && todayJson) {
+        saveSession(supabase, uid, JSON.parse(todayJson) as Session).catch((e) =>
+          setError(e instanceof Error ? e.message : "Could not save your session."),
+        );
       }
-      const { workout, records, messages } = state;
-      window.clearTimeout(saveTimer.current);
-      saveTimer.current = window.setTimeout(() => {
-        saveWorkout(uid, workout);
-        saveRecords(uid, records);
-        saveMessages(uid, messages);
-      }, 700);
-    } else {
-      try {
-        const { workout, records, bodyWeight, bodyWeightChange, messages, plans } = state;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ workout, records, bodyWeight, bodyWeightChange, messages, plans }));
-      } catch {
-        /* storage full / unavailable */
-      }
+    }, 700);
+  }, [todayJson]);
+
+  // localStorage mirror when Supabase isn't configured.
+  useEffect(() => {
+    if (!hydratedRef.current || isSupabaseConfigured) return;
+    try {
+      const { sessions, records, messages, weighIns, memory } = state;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, records, messages, weighIns, memory }));
+    } catch {
+      /* storage full / unavailable */
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.workout, state.records, state.messages, state.bodyWeight, state.bodyWeightChange, state.plans]);
+  }, [state]);
 
   /* ---- timer ---- */
   useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
@@ -181,159 +191,127 @@ export default function GymTracker() {
   /* ---- keep chat pinned to the latest message ---- */
   useEffect(() => {
     if (state.tab === "coach" && chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [state.messages, state.tab]);
+  }, [state.messages, state.thinking, state.tab]);
 
-  /* ---- workout editing ---- */
+  /* ---- workout editing (writes into today's session) ---- */
+  const patchToday = (fn: (ex: Exercise[]) => Exercise[]) =>
+    setState((s) => ({
+      sessions: s.sessions.map((sess) => (sess.date === today ? { ...sess, exercises: fn(sess.exercises) } : sess)),
+    }));
+
   const toggleOpen = (i: number) => setState((s) => ({ openEx: s.openEx === i ? -1 : i }));
   const adjustWeight = (ei: number, si: number, delta: number) =>
-    setState((s) => ({ workout: s.workout.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, w: Math.max(0, Math.round((st.w + delta) * 2) / 2) })) })) }));
+    patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, w: Math.max(0, Math.round((st.w + delta) * 2) / 2) })) })));
   const adjustReps = (ei: number, si: number, delta: number) =>
-    setState((s) => ({ workout: s.workout.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, r: Math.max(1, st.r + delta) })) })) }));
+    patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, r: Math.max(1, st.r + delta) })) })));
   const toggleSet = (ei: number, si: number) =>
-    setState((s) => ({ workout: s.workout.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d: !st.d })) })) }));
+    patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d: !st.d })) })));
 
-  /* ---- finish workout → coach summary ---- */
+  /* ---- the coach: MiniMax, server-side, with write access to everything ---- */
+  const askCoach = useCallback(
+    async (text: string) => {
+      const message = text.trim();
+      if (!message) return;
+      if (!isSupabaseConfigured) {
+        setState({ tab: "coach" });
+        setError("The coach needs Supabase configured — it reads and writes your training log there. Add your Supabase keys to .env.local.");
+        return;
+      }
+      setError(null);
+      setState((s) => ({
+        tab: "coach",
+        draft: "",
+        thinking: true,
+        messages: [...s.messages, { from: "user", text: message }],
+      }));
+
+      try {
+        const token = isSupabaseConfigured ? await getAccessToken() : null;
+        const res = await fetch("/api/coach", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify({ message, today }),
+        });
+        const data = (await res.json()) as { reply?: string; state?: PersistedState; error?: string };
+        if (!res.ok || !data.state) throw new Error(data.error ?? "The coach didn't answer.");
+        adoptPersisted(data.state);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "The coach is unreachable.");
+      } finally {
+        setState({ thinking: false });
+      }
+    },
+    [adoptPersisted, setState, today],
+  );
+
+  const send = () => askCoach(state.draft);
+
+  /* ---- finish workout → let the coach log it and write the summary ---- */
   const finish = () => {
-    const w = state.workout;
-    let vol = 0, setsDone = 0, totalSets = 0, exDone = 0;
-    let top: { name: string; w: number; r: number } | null = null;
-    w.forEach((ex) => {
-      const nd = ex.sets.filter((x) => x.d);
-      totalSets += ex.sets.length;
-      setsDone += nd.length;
-      if (nd.length === ex.sets.length) exDone++;
-      nd.forEach((st) => {
-        vol += st.w * st.r;
-        if (!top || st.w > top.w) top = { name: ex.name, w: st.w, r: st.r };
-      });
-    });
-    const volT = (vol / 1000).toFixed(1);
-    let summary: string;
-    if (setsDone === 0) {
-      summary = "No sets logged yet — check off your sets on the Today tab, then hit Finish and I'll break down the numbers.";
-    } else {
-      const t = top as { name: string; w: number; r: number } | null;
-      summary =
-        "Session recorded. Here's the breakdown:\n\n" +
-        "• Volume: " + volT + " t across " + setsDone + "/" + totalSets + " sets\n" +
-        "• Exercises completed: " + exDone + "/" + w.length + "\n" +
-        (t ? "• Heaviest working set: " + t.name + " at " + t.w + " kg × " + t.r + "\n\n" : "\n") +
-        "Volume is up ~6% on your last push day. Recovery looks fine to progress the top bench set +2.5 kg next time.";
-    }
     if (timerRef.current) clearInterval(timerRef.current);
-    setState((s) => ({ tab: "coach", timerRunning: false, messages: [...s.messages, { from: "coach", text: summary }] }));
+    const mins = Math.round(state.timerSec / 60);
+    setState({ timerRunning: false });
+    askCoach(
+      `I've finished today's session${mins ? ` — it took about ${mins} minutes` : ""}. Log it as complete, then give me the breakdown: volume, sets completed, and what to change next time.`,
+    );
   };
 
-  /* ---- coach send ---- */
-  const send = () => {
-    const raw = state.draft.trim();
-    if (!raw) return;
-    const reply = handle(raw);
-    setState((s) => ({ draft: "", messages: [...s.messages, { from: "user", text: raw }, { from: "coach", text: reply }] }));
-  };
-
-  /* ---- fuzzy matching against the plan ---- */
-  const findEx = (t: string) => {
-    const alias: Record<string, string> = { bench: "Barbell Bench Press", incline: "Incline Dumbbell Press", fly: "Cable Fly", overhead: "Overhead Press", ohp: "Overhead Press", shoulder: "Overhead Press", triceps: "Triceps Pushdown", pushdown: "Triceps Pushdown" };
-    let best = -1, score = 0;
-    state.workout.forEach((e, i) => {
-      let s = e.name.toLowerCase().split(/\s+/).filter((w) => w.length > 2 && t.includes(w)).length;
-      Object.keys(alias).forEach((a) => { if (t.includes(a) && alias[a] === e.name) s += 2; });
-      if (s > score) { score = s; best = i; }
-    });
-    return score > 0 ? best : -1;
-  };
-  const findRecord = (t: string) => {
-    let best = -1, score = 0;
-    state.records.forEach((r, i) => {
-      const s = r.name.toLowerCase().split(/\s+/).filter((w) => w.length > 2 && t.includes(w)).length;
-      if (s > score) { score = s; best = i; }
-    });
-    return score > 0 ? best : -1;
-  };
-  const patchEx = (i: number, fn: (e: Exercise) => Exercise) =>
-    setState((s) => ({ workout: s.workout.map((e, k) => (k === i ? fn(e) : e)) }));
-
-  /* ---- the natural-language coach ---- */
-  const handle = (raw: string): string => {
-    const t = " " + raw.toLowerCase() + " ";
-    const firstNum = () => { const m = raw.match(/(\d+\.?\d*)/); return m ? parseFloat(m[1]) : null; };
-
-    if (/\b(help|commands?|what can you do|how do)\b/.test(t))
-      return "I can change anything in the app. Try:\n\n• \"set bench to 65 kg\"\n• \"add 2.5 kg to squat\"\n• \"make cable fly 4×15\"\n• \"overhead press 10 reps\"\n• \"mark triceps pushdown done\"\n• \"add lateral raise to today\"\n• \"log body weight 77.5\"\n• \"new deadlift PR 125\"";
-
-    let m = raw.match(/(?:body\s*weight|bodyweight|weigh|scale)[^0-9]*(\d+\.?\d*)/i) || raw.match(/log\s+weight[^0-9]*(\d+\.?\d*)/i);
-    if (m) {
-      const w = parseFloat(m[1]), prev = state.bodyWeight, diff = +(w - prev).toFixed(1);
-      setState({ bodyWeight: w, bodyWeightChange: diff });
-      if (isSupabaseConfigured && userIdRef.current) logBodyWeight(userIdRef.current, w);
-      const c = diff < 0 ? "Cut's on track — keep protein ≥1.8 g/kg." : diff > 0 ? "Trending up; fine if you're in a surplus." : "Holding steady.";
-      return "Body weight logged: " + w + " kg (" + (diff >= 0 ? "+" : "−") + Math.abs(diff) + " kg vs last). " + c + " It's on your Progress tab.";
-    }
-
-    if (/\b(pr|record|1rm|max|personal best)\b/.test(t)) {
-      const ri = findRecord(t), n = firstNum();
-      if (ri >= 0 && n) {
-        const r = state.records[ri], old = r.kg;
-        setState((s) => ({ records: s.records.map((x, i) => (i === ri ? { ...x, kg: n, hist: [...x.hist.slice(1), n] } : x)) }));
-        return "New " + r.name + " record: " + n + " kg (was " + old + "). A " + (n >= old ? "+" : "−") + Math.abs(+(n - old).toFixed(1)) + " kg move — I'll scale your working sets to ~80% of that.";
-      }
-    }
-
-    const ei = findEx(t);
-    if (ei >= 0) {
-      const ex = state.workout[ei], name = ex.name;
-      if (/\b(done|complete|completed|finished|log|logged|tick)\b/.test(t)) {
-        patchEx(ei, (e) => ({ ...e, sets: e.sets.map((x) => ({ ...x, d: true })) }));
-        return name + " marked complete — all " + ex.sets.length + " sets logged. Clean session.";
-      }
-      const rm = raw.match(/(\d+)\s*[x×]\s*(\d+)/i);
-      if (rm) {
-        const sets = parseInt(rm[1]), reps = parseInt(rm[2]), w = ex.sets[0] ? ex.sets[0].w : 20;
-        patchEx(ei, (e) => ({ ...e, sets: Array.from({ length: sets }, (_, k) => (e.sets[k] ? { ...e.sets[k], r: reps } : { w, r: reps, d: false })) }));
-        return "Updated " + name + " to " + sets + " × " + reps + ". Locked into today's plan.";
-      }
-      if (/\brep/.test(t)) { const n = firstNum(); if (n) { patchEx(ei, (e) => ({ ...e, sets: e.sets.map((x) => ({ ...x, r: Math.round(n) })) })); return "Set " + name + " to " + Math.round(n) + " reps per set."; } }
-      if (/\b(add|increase|up|bump|raise)\b/.test(t)) { const n = firstNum(); if (n) { patchEx(ei, (e) => ({ ...e, sets: e.sets.map((x) => ({ ...x, w: Math.max(0, +(x.w + n).toFixed(1)) })) })); return "Added " + n + " kg to every " + name + " set. Progressive overload — hold your form."; } }
-      if (/\b(reduce|drop|lower|decrease|deload)\b/.test(t)) { const n = firstNum(); if (n) { patchEx(ei, (e) => ({ ...e, sets: e.sets.map((x) => ({ ...x, w: Math.max(0, +(x.w - n).toFixed(1)) })) })); return "Dropped " + name + " by " + n + " kg per set. Smart fatigue management."; } }
-      const n = firstNum();
-      if (n !== null) { patchEx(ei, (e) => ({ ...e, sets: e.sets.map((x) => ({ ...x, w: n })) })); return name + " set to " + n + " kg across all sets. Updated on the Today tab."; }
-      return "Found " + name + " in today's plan. Give me a weight, reps (e.g. 4×8), or say \"mark it done\".";
-    }
-
-    m = raw.match(/add\s+(.+?)\s+to\s+(?:today|the plan|plan|workout)/i);
-    if (m) {
-      const name = m[1].trim().replace(/\b\w/g, (c) => c.toUpperCase());
-      const rm = raw.match(/(\d+)\s*[x×]\s*(\d+)/), wm = raw.match(/(\d+\.?\d*)\s*kg/i);
-      const sets = rm ? parseInt(rm[1]) : 3, reps = rm ? parseInt(rm[2]) : 12, w = wm ? parseFloat(wm[1]) : 20;
-      setState((s) => ({ workout: [...s.workout, { name, sets: Array.from({ length: sets }, () => ({ w, r: reps, d: false })) }] }));
-      return "Added " + name + " to today — " + sets + " × " + reps + " at " + w + " kg. Adjust the load anytime.";
-    }
-
-    return "I've got your whole log. Volume's up ~6% this block and recovery looks fine. Tell me what to change — e.g. \"set bench to 65\", \"log body weight 77\", or \"mark cable fly done\". Type \"help\" for everything I can do.";
-  };
-
-  /* ---- modal (upcoming session) ---- */
-  const openModal = (i: number) => setState({ modalPlan: i });
+  /* ---- modal (a scheduled session) ---- */
   const closeModal = () => setState({ modalPlan: null, dragY: 0, dragging: false });
   const dragStart = (e: React.PointerEvent<HTMLDivElement>) => { dy0.current = e.clientY; e.currentTarget.setPointerCapture?.(e.pointerId); setState({ dragging: true }); };
   const dragMove = (e: React.PointerEvent<HTMLDivElement>) => { if (!state.dragging) return; setState({ dragY: Math.max(0, e.clientY - dy0.current) }); };
   const dragEnd = () => { if (state.dragY > 90) closeModal(); else setState({ dragY: 0, dragging: false }); };
-  const askCoach = () => {
-    if (state.modalPlan === null) return;
-    const p = state.plans[state.modalPlan];
-    if (!p.ex.length) return;
-    const ask = "Can you review my " + p.title + " (" + p.groups + ") plan?";
-    const reply = p.title + " looks balanced. Starting with " + p.ex[0][0] + " is right — it's your heaviest compound while you're freshest. " +
-      "Your last " + p.title.toLowerCase() + " hit RPE 8 on the top sets, so keep loads as prescribed and add 2.5 kg only if bar speed stays sharp. Rest 2–3 min on the first two lifts, 60–90 s on the rest.";
-    setState((s) => ({ modalPlan: null, tab: "coach", messages: [...s.messages, { from: "user", text: ask }, { from: "coach", text: reply }] }));
+  const reviewSession = (s: Session) => {
+    closeModal();
+    askCoach(`Review my ${s.title} on ${s.date} (${s.groups}). Is it the right work for where I'm at, and would you change any of the loads?`);
+  };
+
+  /* ---- progress figures, all derived from stored sessions ---- */
+  const monthStats = useMemo(() => {
+    const prefix = month.slice(0, 7);
+    const done = state.sessions.filter((s) => s.date.startsWith(prefix) && s.completed);
+    return { count: done.length, volume: done.reduce((t, s) => t + sessionVolume(s), 0) };
+  }, [state.sessions, month]);
+
+  const bw = state.weighIns[state.weighIns.length - 1];
+  const bwPrev = state.weighIns[state.weighIns.length - 2];
+  const bwChange = bw && bwPrev ? +(bw.kg - bwPrev.kg).toFixed(1) : 0;
+
+  /* ---- calendar grid for the displayed month ---- */
+  const grid = useMemo(() => {
+    const first = fromISO(month);
+    const lead = (first.getDay() + 6) % 7; // Monday-first
+    const days = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    const cells: { key: string; iso: string | null }[] = [];
+    for (let i = 0; i < lead; i++) cells.push({ key: `blank-${i}`, iso: null });
+    for (let n = 1; n <= days; n++) {
+      const iso = toISO(new Date(first.getFullYear(), first.getMonth(), n));
+      cells.push({ key: iso, iso });
+    }
+    return cells;
+  }, [month]);
+
+  const shiftMonth = (delta: number) => {
+    const d = fromISO(month);
+    d.setMonth(d.getMonth() + delta);
+    setMonth(toISO(new Date(d.getFullYear(), d.getMonth(), 1)));
   };
 
   /* ---- derived ---- */
-  const doneCount = state.workout.filter((ex) => ex.sets.every((x) => x.d)).length;
+  const doneCount = workout.filter((ex) => ex.sets.length > 0 && ex.sets.every((x) => x.d)).length;
   const timerLabel = Math.floor(state.timerSec / 60).toString().padStart(2, "0") + ":" + (state.timerSec % 60).toString().padStart(2, "0");
   const sign = (v: number) => (v >= 0 ? "+" : "−") + Math.abs(v);
-  const modal = state.modalPlan !== null ? state.plans[state.modalPlan] : null;
+  const modal = state.modalPlan ? byDate.get(state.modalPlan) ?? null : null;
+
+  if (!ready) {
+    return (
+      <div className="app">
+        <div className="body" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div className="klabel">Loading your log…</div>
+        </div>
+      </div>
+    );
+  }
 
   /* ================================================================ *
    * Render
@@ -345,11 +323,11 @@ export default function GymTracker() {
           {state.tab === "today" && (
             <div style={{ padding: "14px 26px 30px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div className="klabel">Mon · 21 Jul</div>
+                <div className="klabel">{longLabel(today)}</div>
                 <div style={{ width: 34, height: 34, borderRadius: "50%", background: "#e2e0da" }} />
               </div>
               <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, margin: "20px 0 4px" }}>
-                <h1 style={{ margin: 0, fontSize: 38, fontWeight: 800, lineHeight: 0.98, letterSpacing: "-.02em" }}>Push Day</h1>
+                <h1 style={{ margin: 0, fontSize: 38, fontWeight: 800, lineHeight: 0.98, letterSpacing: "-.02em" }}>{todaySession?.title ?? "Nothing planned"}</h1>
                 <button
                   onClick={toggleTimer}
                   style={{ display: "flex", alignItems: "center", gap: 7, border: `1px solid ${state.timerRunning ? "#3c8cff" : "#dcdad3"}`, background: state.timerRunning ? "#eaf2ff" : "#fff", color: state.timerRunning ? "#2d6fd0" : "#12120f", borderRadius: 12, padding: "7px 12px", cursor: "pointer", flex: "none", transform: "translateY(-3px)" }}
@@ -358,48 +336,62 @@ export default function GymTracker() {
                   <span className="mono" style={{ fontSize: 16, fontWeight: 700, letterSpacing: ".02em" }}>{timerLabel}</span>
                 </button>
               </div>
-              <div style={{ fontSize: 15, color: "#6b6b64" }}>Chest · Shoulders · Triceps</div>
-              <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 4 }}>{doneCount} of {state.workout.length} done · ~52 min</div>
+              <div style={{ fontSize: 15, color: "#6b6b64" }}>{todaySession?.groups ?? "Ask your coach to plan something"}</div>
+              {workout.length > 0 && (
+                <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 4 }}>
+                  {doneCount} of {workout.length} done{todaySession?.completed ? " · logged" : ""}
+                </div>
+              )}
+              {todaySession?.notes && (
+                <div style={{ marginTop: 12, padding: "11px 13px", borderRadius: 12, background: "#efedE7", fontSize: 13, lineHeight: 1.45, color: "#4a4a44" }}>{todaySession.notes}</div>
+              )}
               <div style={{ ...hairline, margin: "22px -26px 0" }} />
 
-              {state.workout.map((ex, i) => {
+              {workout.length === 0 && (
+                <div style={{ padding: "40px 0 8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 15, color: "#8a8a82", lineHeight: 1.5 }}>
+                    {todaySession ? "Rest day — nothing on the bar." : "No session on the calendar for today."}
+                  </div>
+                  <button className="btnp" style={{ marginTop: 20 }} onClick={() => askCoach("Plan me a session for today based on where I am in my split, and put it on the calendar.")}>
+                    Ask coach to plan today
+                  </button>
+                </div>
+              )}
+
+              {workout.map((ex, i) => {
                 const nsets = ex.sets.length;
                 const ndone = ex.sets.filter((x) => x.d).length;
-                const allDone = ndone === nsets;
+                const allDone = nsets > 0 && ndone === nsets;
                 const open = state.openEx === i;
                 return (
-                  <div key={i} style={{ borderBottom: "1px solid rgba(0,0,0,.07)" }}>
+                  <div key={`${ex.name}-${i}`} style={{ borderBottom: "1px solid rgba(0,0,0,.07)" }}>
                     <button onClick={() => toggleOpen(i)} style={{ display: "flex", alignItems: "center", gap: 14, padding: "18px 0", border: "none", background: "none", width: "100%", textAlign: "left", cursor: "pointer" }}>
                       <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 20 }}>{String(i + 1).padStart(2, "0")}</div>
                       <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 17, fontWeight: 700, color: allDone ? "#9a9a92" : "#12120f" }}>{ex.name}</div>
-                        <div className="mono" style={{ fontSize: 13, color: "#8a8a82", marginTop: 3 }}>{nsets} × {ex.sets[0].r} · {ex.sets[0].w} kg</div>
+                        <div className="mono" style={{ fontSize: 13, color: "#8a8a82", marginTop: 3 }}>{scheme(ex)}</div>
                       </div>
                       <div className="mono" style={{ fontSize: 12, color: "#3c8cff", fontWeight: 600 }}>{ndone}/{nsets}</div>
                       <div style={{ color: "#c3c1b8", fontSize: 14, transform: `rotate(${open ? 180 : 0}deg)`, transition: "transform .2s" }}>▾</div>
                     </button>
                     {open && (
-                      <div style={{ padding: "2px 0 16px 34px", display: "flex", flexDirection: "column", gap: 2 }}>
-                        <div className="klabel" style={{ display: "flex", alignItems: "center", gap: 10, paddingBottom: 4 }}>
-                          <div style={{ width: 34, flex: "none" }} />
-                          <div style={{ width: 114, textAlign: "center" }}>kg</div>
-                          <div style={{ width: 104, textAlign: "center" }}>reps</div>
-                          <div style={{ width: 22, marginLeft: "auto" }} />
-                        </div>
+                      <div style={{ padding: "2px 0 16px 30px", display: "flex", flexDirection: "column", gap: 6 }}>
                         {ex.sets.map((st, j) => (
-                          <div key={j} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0" }}>
-                            <div className="mono" style={{ fontSize: 12, color: "#9a9a92", width: 34, flex: "none" }}>Set {j + 1}</div>
-                            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                              <button onClick={() => adjustWeight(i, j, -2.5)} style={stepBtn}>−</button>
-                              <div className="mono" style={{ width: 56, textAlign: "center", whiteSpace: "nowrap", color: st.d ? "#9a9a92" : "#12120f", fontSize: 17, fontWeight: 700 }}>{st.w}</div>
-                              <button onClick={() => adjustWeight(i, j, 2.5)} style={stepBtn}>+</button>
-                            </div>
-                            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                              <button onClick={() => adjustReps(i, j, -1)} style={stepBtn}>−</button>
-                              <div className="mono" style={{ width: 46, textAlign: "center", whiteSpace: "nowrap", color: st.d ? "#9a9a92" : "#12120f", fontSize: 17, fontWeight: 700 }}>{st.r}</div>
-                              <button onClick={() => adjustReps(i, j, 1)} style={stepBtn}>+</button>
-                            </div>
-                            <button onClick={() => toggleSet(i, j)} style={{ width: 22, height: 22, border: `2px solid ${st.d ? "#3c8cff" : "#d8d6cf"}`, background: st.d ? "#3c8cff" : "transparent", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, cursor: "pointer", flex: "none", marginLeft: "auto" }}>{st.d ? "✓" : ""}</button>
+                          <div key={j} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", maxWidth: 296, padding: "7px 12px", borderRadius: 13, background: j % 2 === 0 ? "#eef2fa" : "#f5f4f1" }}>
+                            <button
+                              onClick={() => toggleSet(i, j)}
+                              aria-label={`Mark set ${j + 1} ${st.d ? "not done" : "done"}`}
+                              style={{ width: 22, height: 22, flex: "none", border: `2px solid ${st.d ? "#3c8cff" : "#d0cec7"}`, background: st.d ? "#3c8cff" : "transparent", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 11, cursor: "pointer" }}
+                            >
+                              {st.d ? "✓" : ""}
+                            </button>
+                            <div className="mono" style={{ fontSize: 11, color: "#8a8a82", width: 32, flex: "none" }}>Set {j + 1}</div>
+                            <div className="mono" style={{ width: 52, flex: "none", textAlign: "right", fontSize: 19, fontWeight: 700, letterSpacing: "-.01em" }}>{st.w}</div>
+                            <div style={{ fontSize: 11, color: "#8a8a82", width: 14, flex: "none", marginLeft: -4 }}>kg</div>
+                            <Spinner label={`weight of set ${j + 1}`} onUp={() => adjustWeight(i, j, 2.5)} onDown={() => adjustWeight(i, j, -2.5)} />
+                            <div className="mono" style={{ width: 26, flex: "none", textAlign: "right", fontSize: 19, fontWeight: 700, letterSpacing: "-.01em" }}>{st.r}</div>
+                            <div style={{ fontSize: 11, color: "#8a8a82", width: 24, flex: "none", marginLeft: -4 }}>reps</div>
+                            <Spinner label={`reps of set ${j + 1}`} onUp={() => adjustReps(i, j, 1)} onDown={() => adjustReps(i, j, -1)} />
                           </div>
                         ))}
                       </div>
@@ -407,7 +399,11 @@ export default function GymTracker() {
                   </div>
                 );
               })}
-              <button className="btnp" style={{ marginTop: 24 }} onClick={finish}>Finish Workout</button>
+              {workout.length > 0 && (
+                <button className="btnp" style={{ marginTop: 24 }} onClick={finish} disabled={state.thinking}>
+                  {state.thinking ? "Coach is logging it…" : "Finish Workout"}
+                </button>
+              )}
             </div>
           )}
 
@@ -418,32 +414,37 @@ export default function GymTracker() {
               <h1 style={{ margin: "12px 0 20px", fontSize: 34, fontWeight: 800, letterSpacing: "-.02em" }}>This month</h1>
               <div style={{ display: "flex", borderTop: "1px solid rgba(0,0,0,.09)" }}>
                 <div style={{ flex: 1, padding: "16px 0", borderRight: "1px solid rgba(0,0,0,.09)" }}>
-                  <div className="mono" style={{ fontSize: 30, fontWeight: 700, letterSpacing: "-.02em" }}>14</div>
+                  <div className="mono" style={{ fontSize: 30, fontWeight: 700, letterSpacing: "-.02em" }}>{monthStats.count}</div>
                   <div style={{ fontSize: 12, color: "#8a8a82" }}>workouts</div>
                 </div>
                 <div style={{ flex: 1, padding: "16px 0 16px 18px" }}>
-                  <div className="mono" style={{ fontSize: 30, fontWeight: 700, letterSpacing: "-.02em" }}>48<span style={{ fontSize: 14 }}>t</span></div>
+                  <div className="mono" style={{ fontSize: 30, fontWeight: 700, letterSpacing: "-.02em" }}>{(monthStats.volume / 1000).toFixed(1)}<span style={{ fontSize: 14 }}>t</span></div>
                   <div style={{ fontSize: 12, color: "#8a8a82" }}>total volume</div>
                 </div>
               </div>
               <div style={hairline} />
 
               <div style={{ marginTop: 26 }} className="klabel">Body weight</div>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 8, margin: "8px 0 12px" }}>
-                <div className="mono" style={{ fontSize: 26, fontWeight: 700 }}>{state.bodyWeight} kg</div>
-                <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600 }}>{sign(state.bodyWeightChange)} kg</div>
-              </div>
-              <svg viewBox="0 0 300 90" style={{ width: "100%", height: 90, display: "block" }}>
-                <polyline points="0,58 50,52 100,55 150,44 200,40 250,30 300,26" fill="none" stroke="#3c8cff" strokeWidth="2.5" strokeLinecap="round" />
-                <circle cx="300" cy="26" r="4" fill="#3c8cff" />
-              </svg>
+              {bw ? (
+                <>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8, margin: "8px 0 12px" }}>
+                    <div className="mono" style={{ fontSize: 26, fontWeight: 700 }}>{bw.kg} kg</div>
+                    <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600 }}>{sign(bwChange)} kg</div>
+                  </div>
+                  <WeightChart points={state.weighIns.slice(-12).map((w) => w.kg)} />
+                </>
+              ) : (
+                <div style={{ fontSize: 14, color: "#8a8a82", margin: "8px 0" }}>No weigh-ins yet — tell the coach “log body weight 78”.</div>
+              )}
 
               <div style={{ marginTop: 26, display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
                 <span className="klabel">Lift records</span>
                 <span className="mono" style={{ fontSize: 11, color: "#c3c1b8" }}>PPL split · tap to expand</span>
               </div>
-              {([{ key: "push", label: "Push" }, { key: "pull", label: "Pull" }, { key: "legs", label: "Legs" }] as { key: Plan; label: string }[]).map((g) => {
+              {([{ key: "push", label: "Push" }, { key: "pull", label: "Pull" }, { key: "legs", label: "Legs" }] as { key: LiftPlan; label: string }[]).map((g) => {
                 const color = PLAN_COLOR[g.key];
+                const group = state.records.filter((r) => r.plan === g.key);
+                if (!group.length) return null;
                 return (
                   <div key={g.key}>
                     <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8 }}>
@@ -451,10 +452,11 @@ export default function GymTracker() {
                       <span className="klabel" style={{ color }}>{g.label}</span>
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", marginTop: 2 }}>
-                      {state.records.filter((r) => r.plan === g.key).map((r) => {
+                      {group.map((r) => {
                         const open = state.openRecord === r.name;
-                        const mx = Math.max(...r.hist), mn = Math.min(...r.hist), rng = mx - mn || 1;
-                        const d = +(r.hist[r.hist.length - 1] - r.hist[0]).toFixed(1);
+                        const hist = r.hist.length ? r.hist : [r.kg];
+                        const mx = Math.max(...hist), mn = Math.min(...hist), rng = mx - mn || 1;
+                        const d = +(hist[hist.length - 1] - hist[0]).toFixed(1);
                         return (
                           <div key={r.name} style={{ borderBottom: "1px solid rgba(0,0,0,.07)" }}>
                             <button onClick={() => setState((s) => ({ openRecord: s.openRecord === r.name ? null : r.name }))} style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 0", border: "none", background: "none", width: "100%", textAlign: "left", cursor: "pointer" }}>
@@ -465,8 +467,8 @@ export default function GymTracker() {
                             {open && (
                               <div style={{ padding: "2px 0 16px" }}>
                                 <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 52, marginBottom: 8 }}>
-                                  {r.hist.map((v, idx) => {
-                                    const isLast = idx === r.hist.length - 1;
+                                  {hist.map((v, idx) => {
+                                    const isLast = idx === hist.length - 1;
                                     return (
                                       <div key={idx} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", gap: 5, height: "100%" }}>
                                         <span className="mono" style={{ fontSize: 10, color: isLast ? "#12120f" : "#a7a79f", fontWeight: 600 }}>{v}</span>
@@ -476,10 +478,10 @@ export default function GymTracker() {
                                   })}
                                 </div>
                                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                                  <span className="mono" style={{ fontSize: 11, color: "#9a9a92" }}>last 4 sessions (kg)</span>
-                                  <span className="mono" style={{ fontSize: 11, color: "#3c8cff", fontWeight: 600 }}>{sign(d)} kg over 4</span>
+                                  <span className="mono" style={{ fontSize: 11, color: "#9a9a92" }}>last {hist.length} sessions (kg)</span>
+                                  <span className="mono" style={{ fontSize: 11, color: "#3c8cff", fontWeight: 600 }}>{sign(d)} kg over {hist.length}</span>
                                 </div>
-                                <div style={{ fontSize: 13, color: "#6b6b64", marginTop: 6, lineHeight: 1.4 }}>{r.note}</div>
+                                {r.note && <div style={{ fontSize: 13, color: "#6b6b64", marginTop: 6, lineHeight: 1.4 }}>{r.note}</div>}
                               </div>
                             )}
                           </div>
@@ -489,6 +491,20 @@ export default function GymTracker() {
                   </div>
                 );
               })}
+
+              {Object.keys(state.memory).length > 0 && (
+                <>
+                  <div style={{ marginTop: 26 }} className="klabel">What your coach knows</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+                    {Object.entries(state.memory).map(([k, v]) => (
+                      <div key={k} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "10px 13px", borderRadius: 12, background: "#efedE7" }}>
+                        <span className="mono" style={{ fontSize: 11, color: "#8a8a82", flex: "none" }}>{k.replace(/_/g, " ")}</span>
+                        <span style={{ fontSize: 13, lineHeight: 1.4 }}>{v}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
 
               <div style={{ marginTop: 26 }} className="klabel">Progress photos</div>
               <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
@@ -503,32 +519,63 @@ export default function GymTracker() {
           {state.tab === "calendar" && (
             <div style={{ padding: "14px 26px 30px" }}>
               <div className="klabel">Calendar</div>
-              <h1 style={{ margin: "12px 0 20px", fontSize: 34, fontWeight: 800, letterSpacing: "-.02em" }}>July 2026</h1>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "12px 0 20px" }}>
+                <h1 style={{ margin: 0, fontSize: 34, fontWeight: 800, letterSpacing: "-.02em" }}>{monthLabel(month)}</h1>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {([["‹", -1], ["›", 1]] as [string, number][]).map(([glyph, delta]) => (
+                    <button key={glyph} onClick={() => shiftMonth(delta)} aria-label={delta < 0 ? "Previous month" : "Next month"} style={{ width: 32, height: 32, borderRadius: 10, border: "1px solid #dcdad3", background: "#fff", cursor: "pointer", fontSize: 16, color: "#12120f" }}>{glyph}</button>
+                  ))}
+                </div>
+              </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", textAlign: "center" }}>
                 {["M", "T", "W", "T", "F", "S", "S"].map((d, i) => (
                   <div key={i} className="mono" style={{ fontSize: 11, color: "#9a9a92", paddingBottom: 10 }}>{d}</div>
                 ))}
-                {DAYS.map((d, i) => (
-                  <div key={i} style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" }}>
-                    <span className="mono" style={{ fontSize: 14, color: d.color, fontWeight: d.weight, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%", background: d.today ? "#12120f" : "transparent" }}>{d.n}</span>
-                    <span style={{ width: 5, height: 5, borderRadius: "50%", background: d.dot, marginTop: 3 }} />
-                  </div>
-                ))}
+                {grid.map((cell) => {
+                  const session = cell.iso ? byDate.get(cell.iso) : undefined;
+                  const isToday = cell.iso === today;
+                  const planColor = session && session.plan !== "rest" ? PLAN_COLOR[session.plan] : null;
+                  const filled = Boolean(session?.completed) && Boolean(planColor);
+                  return (
+                    <button
+                      key={cell.key}
+                      onClick={() => cell.iso && session && session.exercises.length > 0 && setState({ modalPlan: cell.iso })}
+                      disabled={!session || session.exercises.length === 0}
+                      style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", border: "none", background: "none", padding: 0, cursor: session?.exercises.length ? "pointer" : "default" }}
+                    >
+                      <span className="mono" style={{ fontSize: 14, color: isToday ? "#fff" : "#12120f", fontWeight: isToday ? 700 : 400, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%", background: isToday ? "#12120f" : "transparent" }}>
+                        {cell.iso ? String(fromISO(cell.iso).getDate()) : ""}
+                      </span>
+                      <span
+                        style={{
+                          width: 5,
+                          height: 5,
+                          borderRadius: "50%",
+                          marginTop: 3,
+                          background: filled ? planColor! : "transparent",
+                          border: !filled && planColor ? `1px solid ${planColor}` : "1px solid transparent",
+                        }}
+                      />
+                    </button>
+                  );
+                })}
               </div>
               <div style={{ ...hairline, margin: "20px -26px" }} />
               <div style={{ display: "flex", flexWrap: "wrap", gap: 14, fontSize: 12, color: "#8a8a82" }}>
-                {([["Push", "#3c8cff"], ["Pull", "oklch(0.7 0.12 165)"], ["Legs", "oklch(0.72 0.13 55)"], ["Today", "#12120f"]] as [string, string][]).map(([label, c]) => (
+                {([["Push", PLAN_COLOR.push], ["Pull", PLAN_COLOR.pull], ["Legs", PLAN_COLOR.legs], ["Today", "#12120f"]] as [string, string][]).map(([label, c]) => (
                   <span key={label} style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: c }} />{label}</span>
                 ))}
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: "50%", border: "1px solid #9a9a92" }} />Planned</span>
               </div>
               <div className="klabel" style={{ marginTop: 24 }}>Upcoming</div>
               <div style={{ display: "flex", flexDirection: "column", marginTop: 6 }}>
-                {state.plans.map((p, i) => {
-                  const rest = p.ex.length === 0;
+                {upcoming.length === 0 && <div style={{ fontSize: 14, color: "#8a8a82", padding: "14px 0" }}>Nothing scheduled. Ask your coach to build the week.</div>}
+                {upcoming.map((p) => {
+                  const rest = p.exercises.length === 0;
                   return (
-                    <button key={i} onClick={() => !rest && openModal(i)} style={{ display: "flex", gap: 14, alignItems: "center", padding: "15px 0", border: "none", borderBottom: "1px solid rgba(0,0,0,.07)", background: "none", width: "100%", textAlign: "left", cursor: rest ? "default" : "pointer" }}>
-                      <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 44, flex: "none" }}>{p.date}</div>
-                      <div style={{ width: 6, height: 30, borderRadius: 4, background: p.color, flex: "none" }} />
+                    <button key={p.date} onClick={() => !rest && setState({ modalPlan: p.date })} style={{ display: "flex", gap: 14, alignItems: "center", padding: "15px 0", border: "none", borderBottom: "1px solid rgba(0,0,0,.07)", background: "none", width: "100%", textAlign: "left", cursor: rest ? "default" : "pointer" }}>
+                      <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 44, flex: "none" }}>{shortLabel(p.date)}</div>
+                      <div style={{ width: 6, height: 30, borderRadius: 4, background: PLAN_COLOR[p.plan], flex: "none" }} />
                       <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 16, fontWeight: 700, color: rest ? "#9a9a92" : "#12120f" }}>{p.title}</div>
                         <div className="mono" style={{ fontSize: 12, color: "#8a8a82" }}>{p.groups}</div>
@@ -550,7 +597,7 @@ export default function GymTracker() {
                   <div className="mono" style={{ width: 36, height: 36, borderRadius: "50%", background: "#12120f", display: "flex", alignItems: "center", justifyContent: "center", color: "#3c8cff", fontWeight: 800 }}>C</div>
                   <div>
                     <div style={{ fontSize: 17, fontWeight: 800, lineHeight: 1 }}>Coach</div>
-                    <div style={{ fontSize: 11, color: "#8a8a82" }}>Analytical · always on</div>
+                    <div style={{ fontSize: 11, color: "#8a8a82" }}>MiniMax · reads and writes your whole log</div>
                   </div>
                 </div>
               </div>
@@ -558,19 +605,39 @@ export default function GymTracker() {
                 {state.messages.map((mmsg, i) => {
                   const coach = mmsg.from === "coach";
                   return (
-                    <div key={i} style={{ alignSelf: coach ? "flex-start" : "flex-end", maxWidth: "80%", background: coach ? "#efedE7" : "#12120f", color: coach ? "#12120f" : "#fff", padding: "12px 15px", borderRadius: coach ? "4px 16px 16px 16px" : "16px 16px 4px 16px", fontSize: 14, lineHeight: 1.45, whiteSpace: "pre-line" }}>{mmsg.text}</div>
+                    <div key={i} style={{ alignSelf: coach ? "flex-start" : "flex-end", maxWidth: "84%", display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div style={{ background: coach ? "#efedE7" : "#12120f", color: coach ? "#12120f" : "#fff", padding: "12px 15px", borderRadius: coach ? "4px 16px 16px 16px" : "16px 16px 4px 16px", fontSize: 14, lineHeight: 1.45, whiteSpace: "pre-line" }}>{mmsg.text}</div>
+                      {mmsg.actions?.length ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 3, paddingLeft: 2 }}>
+                          {mmsg.actions.map((a, k) => (
+                            <div key={k} className="mono" style={{ fontSize: 10.5, color: "#3c8cff", display: "flex", gap: 5 }}>
+                              <span style={{ flex: "none" }}>✓</span>
+                              <span>{a}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
                   );
                 })}
+                {state.thinking && (
+                  <div style={{ alignSelf: "flex-start", background: "#efedE7", padding: "12px 15px", borderRadius: "4px 16px 16px 16px" }}>
+                    <span className="mono" style={{ fontSize: 12, color: "#8a8a82" }}>Coach is working…</span>
+                  </div>
+                )}
+                {error && (
+                  <div style={{ alignSelf: "center", maxWidth: "90%", background: "#fdecec", color: "#8f2d2d", padding: "10px 14px", borderRadius: 12, fontSize: 12.5, lineHeight: 1.45 }}>{error}</div>
+                )}
               </div>
               <div style={{ flex: "none", padding: "12px 18px 16px", borderTop: "1px solid rgba(0,0,0,.08)", display: "flex", gap: 10, alignItems: "center" }}>
                 <input
                   value={state.draft}
                   onInput={(e) => setState({ draft: (e.target as HTMLInputElement).value })}
-                  onKeyDown={(e) => { if (e.key === "Enter") send(); }}
-                  placeholder="Try “set bench to 65” or “help”…"
+                  onKeyDown={(e) => { if (e.key === "Enter" && !state.thinking) send(); }}
+                  placeholder="Ask for anything — “make today easier”, “plan my week”…"
                   style={{ flex: 1, minWidth: 0, border: "1px solid #dcdad3", borderRadius: 22, padding: "12px 16px", font: "400 14px var(--font-hanken)", background: "#fff", outline: "none" }}
                 />
-                <button onClick={send} style={{ width: 44, height: 44, borderRadius: "50%", background: "#12120f", color: "#fff", border: "none", fontSize: 18, cursor: "pointer", flex: "none" }}>↑</button>
+                <button onClick={send} disabled={state.thinking || !state.draft.trim()} style={{ width: 44, height: 44, borderRadius: "50%", background: state.thinking || !state.draft.trim() ? "#c3c1b8" : "#12120f", color: "#fff", border: "none", fontSize: 18, cursor: state.thinking ? "default" : "pointer", flex: "none" }}>↑</button>
               </div>
             </div>
           )}
@@ -585,19 +652,20 @@ export default function GymTracker() {
               </div>
               <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
                 <div>
-                  <div className="klabel">{modal.date}</div>
+                  <div className="klabel">{shortLabel(modal.date)}</div>
                   <h2 style={{ margin: "6px 0 3px", fontSize: 30, fontWeight: 800, letterSpacing: "-.02em" }}>{modal.title}</h2>
                   <div style={{ fontSize: 14, color: "#6b6b64" }}>{modal.groups}</div>
                 </div>
-                <button onClick={askCoach} style={{ display: "flex", alignItems: "center", gap: 6, height: 34, padding: "0 13px", borderRadius: 17, border: "none", background: "#12120f", color: "#fff", font: "600 13px var(--font-hanken)", cursor: "pointer", flex: "none" }}><span style={{ color: "#3c8cff" }}>✦</span>Ask Coach</button>
+                <button onClick={() => reviewSession(modal)} style={{ display: "flex", alignItems: "center", gap: 6, height: 34, padding: "0 13px", borderRadius: 17, border: "none", background: "#12120f", color: "#fff", font: "600 13px var(--font-hanken)", cursor: "pointer", flex: "none" }}><span style={{ color: "#3c8cff" }}>✦</span>Ask Coach</button>
               </div>
-              <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 6 }}>{modal.ex.length} exercises</div>
+              <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 6 }}>{modal.exercises.length} exercises{modal.completed ? " · completed" : ""}</div>
+              {modal.notes && <div style={{ marginTop: 12, padding: "11px 13px", borderRadius: 12, background: "#efedE7", fontSize: 13, lineHeight: 1.45, color: "#4a4a44" }}>{modal.notes}</div>}
               <div style={{ ...hairline, margin: "16px -26px 0" }} />
-              {modal.ex.map((e, i) => (
+              {modal.exercises.map((e, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "baseline", gap: 14, padding: "16px 0", borderBottom: "1px solid rgba(0,0,0,.07)" }}>
                   <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 20 }}>{String(i + 1).padStart(2, "0")}</div>
-                  <div style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{e[0]}</div>
-                  <div className="mono" style={{ fontSize: 13, color: "#8a8a82" }}>{e[1]}</div>
+                  <div style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{e.name}</div>
+                  <div className="mono" style={{ fontSize: 13, color: "#8a8a82" }}>{scheme(e)}</div>
                 </div>
               ))}
             </div>
@@ -616,10 +684,28 @@ export default function GymTracker() {
             <svg className="ic" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 9h18M8 3v4M16 3v4" /></svg>Calendar
           </button>
           <button className={`tab ${state.tab === "coach" ? "on" : ""}`} onClick={() => setState({ tab: "coach" })}>
-            <svg className="ic" viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z" /></svg>Coach
+            <svg className="ic" viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z" /></svg>
+            {state.thinking ? <span style={{ color: "#3c8cff" }}>Working…</span> : "Coach"}
           </button>
         </div>
     </div>
   );
 }
 
+/** Body-weight trend, scaled to whatever range the athlete's log actually has. */
+function WeightChart({ points }: { points: number[] }) {
+  if (points.length < 2) return <div style={{ height: 90 }} />;
+  const mx = Math.max(...points), mn = Math.min(...points), rng = mx - mn || 1;
+  const coords = points.map((v, i) => {
+    const x = (i / (points.length - 1)) * 300;
+    const y = 78 - ((v - mn) / rng) * 62;
+    return [x, y] as const;
+  });
+  const last = coords[coords.length - 1];
+  return (
+    <svg viewBox="0 0 300 90" style={{ width: "100%", height: 90, display: "block" }}>
+      <polyline points={coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ")} fill="none" stroke="#3c8cff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={last[0].toFixed(1)} cy={last[1].toFixed(1)} r="4" fill="#3c8cff" />
+    </svg>
+  );
+}

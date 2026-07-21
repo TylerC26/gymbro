@@ -41,3 +41,11 @@ export async function ensureUserId(): Promise<string | null> {
   }
   return data.user?.id ?? null;
 }
+
+/** The JWT the coach API route uses to act as this athlete under RLS. */
+export async function getAccessToken(): Promise<string | null> {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+  const { data } = await supabase.auth.getSession();
+  return data.session?.access_token ?? null;
+}
