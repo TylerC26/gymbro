@@ -42,6 +42,8 @@ a:hover {
   /* 100% of a viewport-height html/body — steadier than 100vh on mobile, where
      vh keeps counting the collapsed URL bar and pushes the tab bar off-screen. */
   height: 100%;
+  /* Clips the content while it slides down under the pull-to-refresh gesture. */
+  overflow: hidden;
   background: #faf9f6;
   padding-top: env(safe-area-inset-top);
 }

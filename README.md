@@ -57,7 +57,9 @@ of training.
 
 - **Today** — the session scheduled for the current date.
   Expand an exercise to step weight (±2.5 kg) and reps, and tick sets off.
-  **Finish Workout** hands the session to the coach, which logs it and writes the breakdown.
+  **Finish Workout** rewrites the day to the sets you actually ticked — the calendar
+  keeps the session that happened, not the one that was planned — then hands it to the
+  coach for the breakdown. Tick nothing and it trims nothing; the coach asks instead.
 - **Progress** — month totals computed from logged sets, a body-weight trend from
   real weigh-ins, per-lift records by Push / Pull / Legs, and what the coach remembers about you.
 - **Calendar** — a month grid built from your sessions (filled dot = trained,

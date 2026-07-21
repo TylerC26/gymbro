@@ -27,6 +27,11 @@ const TOP_RECORDS = 3;
  * transcript above never gets squeezed off the screen. */
 const DRAFT_MAX_HEIGHT = 132;
 
+/* Pull-to-refresh: how far the content follows the finger, and how far it has
+ * to travel before letting go actually refreshes. */
+const PULL_MAX = 90;
+const PULL_TRIGGER = 62;
+
 const EMPTY: State = {
   sessions: [],
   records: [],
@@ -79,6 +84,9 @@ export default function GymTracker() {
   const dy0 = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const pullFrom = useRef<number | null>(null);
+  const [pull, setPull] = useState({ y: 0, refreshing: false });
 
   /* setState with merge semantics */
   const setState = useCallback(
@@ -153,6 +161,51 @@ export default function GymTracker() {
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** Re-read the log from the database. Every tab renders off `state`, so one
+   *  fetch refreshes the whole app — no page reload, no flash of empty. */
+  const refresh = useCallback(async () => {
+    const supabase = getSupabase();
+    const uid = userIdRef.current;
+    if (!supabase || !uid) return;
+    try {
+      adoptPersisted(await loadState(supabase, uid));
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not reach your training log.");
+    }
+  }, [adoptPersisted]);
+
+  /* ---- pull to refresh ---- *
+   * Only arms at the very top of the scroller, so it can never fight a normal
+   * scroll. The drag is damped and capped: a gesture that tracked the finger
+   * 1:1 would tear the header halfway down the screen. */
+  const pullStart = (e: React.TouchEvent) => {
+    if (pull.refreshing || !bodyRef.current || bodyRef.current.scrollTop > 0) return;
+    pullFrom.current = e.touches[0].clientY;
+  };
+  const pullMove = (e: React.TouchEvent) => {
+    if (pullFrom.current === null) return;
+    const dy = e.touches[0].clientY - pullFrom.current;
+    if (dy <= 0) {
+      /* Scrolled back up into the content — hand the gesture back. */
+      pullFrom.current = null;
+      setPull((p) => (p.y ? { ...p, y: 0 } : p));
+      return;
+    }
+    setPull((p) => ({ ...p, y: Math.min(PULL_MAX, dy * 0.45) }));
+  };
+  const pullEnd = async () => {
+    if (pullFrom.current === null) return;
+    pullFrom.current = null;
+    if (pull.y < PULL_TRIGGER) {
+      setPull({ y: 0, refreshing: false });
+      return;
+    }
+    setPull({ y: PULL_TRIGGER, refreshing: true });
+    await refresh();
+    setPull({ y: 0, refreshing: false });
+  };
 
   const submitLogin = async () => {
     if (login.busy || !login.who.trim() || !login.pw) return;
@@ -286,10 +339,60 @@ export default function GymTracker() {
   const send = () => askCoach(state.draft);
 
   /* ---- finish workout → let the coach log it and write the summary ---- */
-  const finish = () =>
+  const finish = async () => {
+    const session = todaySession;
+    if (!session) return;
+
+    const planned = session.exercises.reduce((n, ex) => n + ex.sets.length, 0);
+    const done = session.exercises.reduce((n, ex) => n + ex.sets.filter((st) => st.d).length, 0);
+
+    /* Nothing ticked almost certainly means they forgot, not that they trained
+     * nothing — trimming here would delete the whole day's work. Leave the plan
+     * alone and let the coach sort it out in conversation. */
+    if (done === 0) {
+      askCoach(
+        "I'm done for today but I haven't ticked any sets off. Ask me what I actually got through before you log anything.",
+      );
+      return;
+    }
+
+    /* The calendar should show the session that happened, not the one that was
+     * planned: keep the sets that were ticked, drop the rest. */
+    const skipped: string[] = [];
+    const exercises = session.exercises
+      .map((ex) => {
+        const kept = ex.sets.filter((st) => st.d);
+        if (kept.length < ex.sets.length) skipped.push(`${ex.name} (${ex.sets.length - kept.length} of ${ex.sets.length})`);
+        return { ...ex, sets: kept };
+      })
+      .filter((ex) => ex.sets.length > 0);
+
+    const logged: Session = { ...session, exercises, completed: true };
+    setState((s) => ({ sessions: s.sessions.map((x) => (x.date === today ? logged : x)) }));
+
+    /* Write it through now rather than on the debounce: askCoach reads the log
+     * server-side, so a pending write would leave the coach looking at the plan
+     * it was just told to replace. */
+    window.clearTimeout(saveTimer.current);
+    savedTodayRef.current = JSON.stringify(logged);
+    const supabase = getSupabase();
+    const uid = userIdRef.current;
+    if (supabase && uid) {
+      try {
+        await saveSession(supabase, uid, logged);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not save your session.");
+        return;
+      }
+    }
+
     askCoach(
-      "I've finished today's session. Log it as complete, then give me the breakdown: volume, sets completed, and what to change next time.",
+      `I've finished today's session — ${done} of ${planned} sets. Today's entry now shows only what I actually completed` +
+        (skipped.length ? `; I dropped what I skipped: ${skipped.join(", ")}.` : ".") +
+        " Log it as complete, update my lift records from every lift I trained, then give me the breakdown:" +
+        " volume, sets completed, and what to change next time.",
     );
+  };
 
   /* ---- modal (a scheduled session) ---- */
   const closeModal = () => setState({ modalPlan: null, dragY: 0, dragging: false });
@@ -407,7 +510,32 @@ export default function GymTracker() {
    * ================================================================ */
   return (
     <div className="app">
-        <div className="body">
+        {/* Pull-to-refresh indicator. Sits behind the content, which slides down
+            over it — so it reveals rather than overlaps. */}
+        <div
+          aria-hidden={pull.y === 0}
+          style={{
+            position: "absolute", top: 0, left: 0, right: 0, height: PULL_MAX,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            pointerEvents: "none", opacity: Math.min(1, pull.y / PULL_TRIGGER),
+          }}
+        >
+          <span className="klabel" style={{ color: pull.y >= PULL_TRIGGER || pull.refreshing ? "#3c8cff" : "#a7a79f" }}>
+            {pull.refreshing ? "Refreshing…" : pull.y >= PULL_TRIGGER ? "Release to refresh" : "Pull to refresh"}
+          </span>
+        </div>
+        <div
+          className="body"
+          ref={bodyRef}
+          onTouchStart={pullStart}
+          onTouchMove={pullMove}
+          onTouchEnd={pullEnd}
+          onTouchCancel={pullEnd}
+          style={{
+            transform: pull.y ? `translateY(${pull.y}px)` : undefined,
+            transition: pullFrom.current === null ? "transform .25s ease" : "none",
+          }}
+        >
           {/* ===================== TODAY ===================== */}
           {state.tab === "today" && (
             <div style={{ padding: "14px 26px 30px" }}>
