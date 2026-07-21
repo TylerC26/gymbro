@@ -34,7 +34,7 @@ export async function POST(req: Request) {
   const token = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   if (!token) return NextResponse.json({ error: "Not signed in." }, { status: 401 });
 
-  let body: { message?: string; today?: string };
+  let body: { message?: string; today?: string; mustAct?: boolean };
   try {
     body = await req.json();
   } catch {
@@ -48,6 +48,8 @@ export async function POST(req: Request) {
   /* The athlete's own clock decides what "today" means — the server may be in
    * another timezone entirely. */
   const today = /^\d{4}-\d{2}-\d{2}$/.test(body.today ?? "") ? body.today! : todayISO();
+  /* Set by the buttons that exist to change the log, never by free-text chat. */
+  const mustAct = body.mustAct === true;
 
   /* Request-scoped client carrying the athlete's JWT: every read and write in
    * this request is filtered by the same RLS policies as the browser's. */
@@ -76,6 +78,8 @@ export async function POST(req: Request) {
     ];
 
     const actions: string[] = [];
+    /* One corrective round, at most, per turn. */
+    let nudged = false;
     const started = Date.now();
     let reply = "";
 
@@ -84,6 +88,21 @@ export async function POST(req: Request) {
       messages.push(assistant);
 
       if (!assistant.tool_calls?.length) {
+        /* The athlete pressed a button that means "change my log", and the model
+         * answered with prose instead — listing a session and signing off with
+         * "Ready." as though it had scheduled it. Nothing was written and the
+         * turn would end looking like a success. Give it exactly one corrective
+         * round; if it still will not act, its reply stands rather than the turn
+         * failing outright. */
+        if (mustAct && !actions.length && !nudged) {
+          nudged = true;
+          messages.push({
+            role: "user",
+            content:
+              "[system] You replied without calling a tool, so NOTHING was saved — the athlete asked you to change their log, not to describe a change. Make it now with the right tool (update_session for a day, schedule_block for weeks), then reply.",
+          });
+          continue;
+        }
         reply = (assistant.content ?? "").trim();
         break;
       }

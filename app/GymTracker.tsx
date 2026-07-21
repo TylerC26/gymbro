@@ -300,8 +300,12 @@ export default function GymTracker() {
     patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d: !st.d })) })));
 
   /* ---- the coach: MiniMax, server-side, with write access to everything ---- */
+  /** `mustAct` marks a turn the athlete started by pressing a button that means
+   *  "change my log" — the server then refuses a reply that only describes the
+   *  change instead of writing it. Free-text chat leaves it false, so ordinary
+   *  questions are never pushed into editing anything. */
   const askCoach = useCallback(
-    async (text: string) => {
+    async (text: string, mustAct = false) => {
       const message = text.trim();
       if (!message) return;
       if (!isSupabaseConfigured) {
@@ -322,7 +326,7 @@ export default function GymTracker() {
         const res = await fetch("/api/coach", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-          body: JSON.stringify({ message, today }),
+          body: JSON.stringify({ message, today, mustAct }),
         });
         const data = (await res.json()) as { reply?: string; state?: PersistedState; error?: string };
         if (!res.ok || !data.state) throw new Error(data.error ?? "The coach didn't answer.");
@@ -391,6 +395,7 @@ export default function GymTracker() {
         (skipped.length ? `; I dropped what I skipped: ${skipped.join(", ")}.` : ".") +
         " Log it as complete, update my lift records from every lift I trained, then give me the breakdown:" +
         " volume, sets completed, and what to change next time.",
+      true,
     );
   };
 
@@ -562,7 +567,7 @@ export default function GymTracker() {
                   <div style={{ fontSize: 15, color: "#8a8a82", lineHeight: 1.5 }}>
                     {todaySession ? "Rest day — nothing on the bar." : "No session on the calendar for today."}
                   </div>
-                  <button className="btnp" style={{ marginTop: 20 }} onClick={() => askCoach("Plan me a session for today based on where I am in my split, and put it on the calendar.")}>
+                  <button className="btnp" style={{ marginTop: 20 }} onClick={() => askCoach("Plan me a session for today based on where I am in my split, and put it on the calendar.", true)}>
                     Ask coach to plan today
                   </button>
                 </div>
@@ -885,7 +890,6 @@ export default function GymTracker() {
                       if (!state.thinking) send();
                     }
                   }}
-                  placeholder="Ask for anything — “make today easier”, “plan my week”…"
                   /* 16px, not 14 — iOS Safari auto-zooms the page on focus for anything
                      smaller, and we can't lock that out with maximumScale (see layout.tsx). */
                   style={{
