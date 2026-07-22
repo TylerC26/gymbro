@@ -1,5 +1,5 @@
-import type { PersistedState, Session } from "../types";
-import { longLabel, scheme, sessionVolume, shortLabel } from "../types";
+import type { Exercise, PersistedState, Session } from "../types";
+import { longLabel, sessionVolume, shortLabel } from "../types";
 
 /* Supabase is the coach's memory, so every turn starts by pouring the athlete's
  * whole log into the system prompt: today in full detail, the week ahead, a
@@ -7,9 +7,13 @@ import { longLabel, scheme, sessionVolume, shortLabel } from "../types";
 
 const t = (kg: number) => (kg / 1000).toFixed(1) + "t";
 
+/* The screen's set summary is bare numbers; spell the units out for the coach. */
+const briefSets = (ex: Exercise) =>
+  ex.sets.length ? `${ex.sets.map((s) => s.w).join("/")}kg × ${ex.sets.map((s) => s.r).join("/")} reps` : "no sets";
+
 const describeSession = (s: Session, detail: "full" | "brief") => {
   if (detail === "brief") {
-    const body = s.exercises.length ? s.exercises.map((e) => `${e.name} ${scheme(e)}`).join("; ") : "no exercises";
+    const body = s.exercises.length ? s.exercises.map((e) => `${e.name} ${briefSets(e)}`).join("; ") : "no exercises";
     return `${s.date} (${shortLabel(s.date)}) — ${s.title} [${s.plan}]${s.completed ? " ✓done" : ""}: ${body}`;
   }
   const lines = s.exercises.map((e, i) => {

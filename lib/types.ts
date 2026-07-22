@@ -117,13 +117,11 @@ export const monthLabel = (iso: string) => {
 export const sessionVolume = (s: Session) =>
   s.exercises.reduce((t, ex) => t + ex.sets.reduce((x, st) => x + (st.d ? st.w * st.r : 0), 0), 0);
 
-/** "4 × 8 · 62.5 kg" — derived, never stored, so it can't drift from the sets. */
+/** "62.5/62.5/65/65 8/8/6/6" — one entry per set, weights then reps, so every
+ *  set is readable without opening the exercise. Derived, never stored. */
 export const scheme = (ex: Exercise) => {
   if (!ex.sets.length) return "—";
-  const reps = ex.sets[0].r;
-  const w = ex.sets[0].w;
-  const sameReps = ex.sets.every((s) => s.r === reps);
-  const sameW = ex.sets.every((s) => s.w === w);
-  const repPart = sameReps ? `${ex.sets.length} × ${reps}` : `${ex.sets.length} sets`;
-  return sameW ? `${repPart} · ${w} kg` : repPart;
+  const weights = ex.sets.map((s) => s.w).join("/");
+  const reps = ex.sets.map((s) => s.r).join("/");
+  return `${weights} ${reps}`;
 };

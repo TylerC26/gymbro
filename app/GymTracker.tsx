@@ -15,6 +15,7 @@ import {
 } from "@/lib/types";
 import { currentUserId, getAccessToken, getSupabase, isSupabaseConfigured, signIn, signOut } from "@/lib/supabaseClient";
 import { loadState, saveSession } from "@/lib/db";
+import { encouragement, POP_MS } from "@/lib/encouragement";
 
 const STORAGE_KEY = "gymbro-state-v2";
 
@@ -61,6 +62,11 @@ const loginField: CSSProperties = {
 const spinBox: CSSProperties = { display: "flex", flexDirection: "column", width: 22, height: 30, flex: "none", border: "1px solid #dcdad3", borderRadius: 7, background: "#fff", overflow: "hidden" };
 const spinBtn: CSSProperties = { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: "none", padding: 0, fontSize: 7, lineHeight: 1, color: "#12120f", cursor: "pointer" };
 
+/** Today's lifts with one set's tick set to `d`. Shared by the write and by the
+ *  coach's pop, so the line always describes the log the athlete is looking at. */
+const withSetDone = (exercises: Exercise[], ei: number, si: number, d: boolean) =>
+  exercises.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d })) }));
+
 function Spinner({ label, onUp, onDown }: { label: string; onUp: () => void; onDown: () => void }) {
   return (
     <div style={spinBox}>
@@ -80,6 +86,15 @@ export default function GymTracker() {
   const [error, setError] = useState<string | null>(null);
   const [month, setMonth] = useState(() => `${todayISO().slice(0, 7)}-01`);
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
+
+  /* A line from the coach after a ticked set. `id` is the animation's identity:
+   * a new pop while one is still up must restart it, not inherit its timeline. */
+  const [pop, setPop] = useState<{ id: number; text: string } | null>(null);
+  const popTimer = useRef<number | undefined>(undefined);
+  const popCount = useRef(0);
+  /* Outlives the pop on screen, so the line after a pause isn't the one the
+   * athlete just read. */
+  const lastPop = useRef<string | null>(null);
 
   const dy0 = useRef(0);
   const chatRef = useRef<HTMLDivElement>(null);
@@ -296,8 +311,28 @@ export default function GymTracker() {
     patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, w: Math.max(0, Math.round((st.w + delta) * 2) / 2) })) })));
   const adjustReps = (ei: number, si: number, delta: number) =>
     patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, r: Math.max(1, st.r + delta) })) })));
-  const toggleSet = (ei: number, si: number) =>
-    patchToday((w) => w.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d: !st.d })) })));
+  /* One pop at a time: a fast tapper gets the newest line, not a queue of
+   * stale ones fading out behind it. */
+  const say = (text: string) => {
+    lastPop.current = text;
+    popCount.current += 1;
+    setPop({ id: popCount.current, text });
+    window.clearTimeout(popTimer.current);
+    popTimer.current = window.setTimeout(() => setPop(null), POP_MS);
+  };
+
+  useEffect(() => () => window.clearTimeout(popTimer.current), []);
+
+  const toggleSet = (ei: number, si: number) => {
+    const set = todaySession?.exercises[ei]?.sets[si];
+    patchToday((w) => withSetDone(w, ei, si, !w[ei]?.sets[si]?.d));
+    /* Only on the way to done. Un-ticking is a correction, and cheering it
+     * would make the coach look like it isn't reading the screen. */
+    if (todaySession && set && !set.d) {
+      const after = { ...todaySession, exercises: withSetDone(todaySession.exercises, ei, si, true) };
+      say(encouragement(after, ei, si, state.records, lastPop.current));
+    }
+  };
 
   /* ---- the coach: MiniMax, server-side, with write access to everything ---- */
   /** `mustAct` marks a turn the athlete started by pressing a button that means
@@ -529,6 +564,7 @@ export default function GymTracker() {
             {pull.refreshing ? "Refreshing…" : pull.y >= PULL_TRIGGER ? "Release to refresh" : "Pull to refresh"}
           </span>
         </div>
+        <div className="stage">
         <div
           className="body"
           ref={bodyRef}
@@ -903,6 +939,21 @@ export default function GymTracker() {
               </div>
             </div>
           )}
+        </div>
+
+        {/* A word from the coach when a set is ticked. The wrapper stays
+            mounted so screen readers keep one live region to announce into
+            rather than seeing the whole thing appear and disappear. */}
+        <div className="popwrap" role="status" aria-live="polite">
+          {/* Today only: it's about the set list, and left to float it would
+              land on top of the coach's composer if they switched tabs. */}
+          {pop && state.tab === "today" && (
+            <div key={pop.id} className="pop">
+              <b>Coach</b>
+              <span>{pop.text}</span>
+            </div>
+          )}
+        </div>
         </div>
 
         {/* ===================== MODAL ===================== */}

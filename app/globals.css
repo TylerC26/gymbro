@@ -63,6 +63,88 @@ a:hover {
   display: none;
 }
 
+/* ---- coach pop: a word from the coach when a set is ticked ---- *
+ * Lives in .stage, which wraps the scrolling body, so it holds still just
+ * above the tab bar while the list scrolls under it. */
+.stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.popwrap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  display: flex;
+  justify-content: center;
+  padding: 0 20px;
+  /* Never eat a tap meant for the set row underneath. */
+  pointer-events: none;
+}
+
+.pop {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  max-width: 360px;
+  padding: 11px 15px;
+  border-radius: 14px;
+  background: #12120f;
+  color: #fff;
+  font-size: 13.5px;
+  line-height: 1.4;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
+  animation: pop 2600ms ease forwards;
+}
+
+.pop b {
+  flex: none;
+  font-family: var(--font-space), monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #3c8cff;
+}
+
+@keyframes pop {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.94);
+  }
+  10% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  86% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pop {
+    animation: popfade 2600ms steps(1, end) forwards;
+  }
+  @keyframes popfade {
+    0%,
+    92% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+}
+
 .tabbar {
   flex: none;
   display: flex;
