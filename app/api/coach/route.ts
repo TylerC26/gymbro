@@ -1,7 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import { appendMessages, loadState } from "@/lib/db";
-import { todayISO } from "@/lib/types";
 import { buildContext, SYSTEM_PROMPT } from "@/lib/coach/context";
 import { EXECUTORS, TOOLS, type ToolContext } from "@/lib/coach/tools";
 import { chat, isMinimaxConfigured, MINIMAX_MODEL, MinimaxError, type ChatMessage } from "@/lib/minimax";
@@ -45,9 +44,14 @@ export async function POST(req: Request) {
   if (!userMessage) return NextResponse.json({ error: "Empty message." }, { status: 400 });
   if (userMessage.length > 2000) return NextResponse.json({ error: "That message is too long." }, { status: 400 });
 
-  /* The athlete's own clock decides what "today" means — the server may be in
-   * another timezone entirely. */
-  const today = /^\d{4}-\d{2}-\d{2}$/.test(body.today ?? "") ? body.today! : todayISO();
+  /* The athlete's own clock decides what "today" means — the server runs in UTC,
+   * which is already a different day for a good part of theirs. A guess here
+   * would quietly write "tomorrow" onto the wrong date and read back as a coach
+   * that can't tell what day it is, so ask for a reload instead. */
+  const today = body.today ?? "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) {
+    return NextResponse.json({ error: "The app didn't send today's date — reload and try again." }, { status: 400 });
+  }
   /* Set by the buttons that exist to change the log, never by free-text chat. */
   const mustAct = body.mustAct === true;
 

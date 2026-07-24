@@ -1,9 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import type { Exercise, LiftPlan, PersistedState, Session, State } from "@/lib/types";
+import type { Exercise, LiftPlan, PersistedState, Plan, Session, State } from "@/lib/types";
 import {
   PLAN_COLOR,
+  PLAN_DEFAULTS,
+  PLANS,
+  SELF_SCHEDULED_KEY,
+  describeTrained,
   fromISO,
   longLabel,
   monthLabel,
@@ -12,9 +16,10 @@ import {
   shortLabel,
   todayISO,
   toISO,
+  withSelfScheduledDay,
 } from "@/lib/types";
 import { currentUserId, getAccessToken, getSupabase, isSupabaseConfigured, signIn, signOut } from "@/lib/supabaseClient";
-import { loadState, saveSession } from "@/lib/db";
+import { loadState, logBodyWeight, saveSession, setMemory } from "@/lib/db";
 import { encouragement, POP_MS } from "@/lib/encouragement";
 
 const STORAGE_KEY = "gymbro-state-v2";
@@ -43,7 +48,9 @@ const EMPTY: State = {
   openEx: 0,
   openRecord: null,
   draft: "",
+  weightDraft: "",
   modalPlan: null,
+  pendingPlan: null,
   dragY: 0,
   dragging: false,
   thinking: false,
@@ -67,6 +74,35 @@ const spinBtn: CSSProperties = { flex: 1, display: "flex", alignItems: "center",
 const withSetDone = (exercises: Exercise[], ei: number, si: number, d: boolean) =>
   exercises.map((ex, i) => (i !== ei ? ex : { ...ex, sets: ex.sets.map((st, j) => (j !== si ? st : { ...st, d })) }));
 
+/** A typed weigh-in, or null if it isn't one. The bounds are there to catch a
+ *  slipped decimal point — 774 kg would otherwise sail into the chart and drag
+ *  every other reading flat. Commas are accepted: half the world types 77,4. */
+const parseWeight = (raw: string) => {
+  const kg = Number(raw.replace(",", ".").trim());
+  return Number.isFinite(kg) && kg >= 20 && kg <= 400 ? Math.round(kg * 10) / 10 : null;
+};
+
+/* A lift name is the one thing on this screen you might not know how to do, so
+ * it links out to the tape. "form" narrows a bare lift name to the technique
+ * videos someone standing at the rack is actually after. */
+const videoSearchURL = (name: string) =>
+  `https://www.youtube.com/results?search_query=${encodeURIComponent(`${name} form`)}`;
+
+function ExerciseName({ name, style }: { name: string; style: CSSProperties }) {
+  return (
+    <a
+      href={videoSearchURL(name)}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`Watch ${name} on YouTube`}
+      style={{ textDecoration: "none", display: "inline-flex", alignItems: "baseline", gap: 6, ...style }}
+    >
+      {name}
+      <span aria-hidden style={{ fontSize: 9, color: "#c3c1b8", flex: "none" }}>▶</span>
+    </a>
+  );
+}
+
 function Spinner({ label, onUp, onDown }: { label: string; onUp: () => void; onDown: () => void }) {
   return (
     <div style={spinBox}>
@@ -80,12 +116,39 @@ function Spinner({ label, onUp, onDown }: { label: string; onUp: () => void; onD
  * Component
  * ------------------------------------------------------------------ */
 export default function GymTracker() {
-  const [today] = useState(todayISO);
+  const [today, setToday] = useState(todayISO);
   const [state, setS] = useState<State>(EMPTY);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [month, setMonth] = useState(() => `${todayISO().slice(0, 7)}-01`);
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
+
+  /* `today` anchors the whole app: which session the Today tab shows, which day
+   * an edit is saved to, and what the coach is told "today" and "tomorrow" mean.
+   * Phones suspend this tab rather than reloading it, so read the clock again on
+   * every wake and once a minute besides — left alone, a tab opened last night
+   * goes on insisting it is still last night. */
+  const dayRef = useRef(today);
+  useEffect(() => {
+    const check = () => {
+      const now = todayISO();
+      if (now === dayRef.current) return;
+      const previous = dayRef.current;
+      dayRef.current = now;
+      setToday(now);
+      /* Carry the calendar into the new month, unless the athlete has paged it
+       * somewhere else themselves. */
+      setMonth((m) => (m === `${previous.slice(0, 7)}-01` ? `${now.slice(0, 7)}-01` : m));
+    };
+    const timer = window.setInterval(check, 60_000);
+    document.addEventListener("visibilitychange", check);
+    window.addEventListener("focus", check);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", check);
+      window.removeEventListener("focus", check);
+    };
+  }, []);
 
   /* A line from the coach after a ticked set. `id` is the animation's identity:
    * a new pop while one is still up must restart it, not inherit its timeline. */
@@ -254,6 +317,31 @@ export default function GymTracker() {
   const upcoming = useMemo(() => state.sessions.filter((s) => s.date > today).slice(0, 6), [state.sessions, today]);
   const byDate = useMemo(() => new Map(state.sessions.map((s) => [s.date, s])), [state.sessions]);
 
+  /* Weigh-ins arrive oldest first, one per day. */
+  const todayWeighIn = useMemo(() => state.weighIns.find((w) => w.date === today) ?? null, [state.weighIns, today]);
+  const lastWeighIn = useMemo(
+    () => [...state.weighIns].reverse().find((w) => w.date < today) ?? null,
+    [state.weighIns, today],
+  );
+
+  /** Write today's weigh-in through immediately, exactly like a finished session:
+   *  the coach reads the log server-side, so a number still sitting in a debounce
+   *  would be a number it can't see. */
+  const logWeight = async (kg: number) => {
+    setState((s) => ({
+      weightDraft: "",
+      weighIns: [...s.weighIns.filter((w) => w.date !== today), { date: today, kg }].sort((a, b) => a.date.localeCompare(b.date)),
+    }));
+    const supabase = getSupabase();
+    const uid = userIdRef.current;
+    if (!supabase || !uid) return;
+    try {
+      await logBodyWeight(supabase, uid, kg, today);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save your weigh-in.");
+    }
+  };
+
   // Persist the athlete's own edits to today's session. Coach edits already
   // went through the server, so those arrive pre-saved and are skipped here.
   const todayJson = todaySession ? JSON.stringify(todaySession) : "";
@@ -382,6 +470,12 @@ export default function GymTracker() {
     const session = todaySession;
     if (!session) return;
 
+    /* The weigh-in goes in first and unconditionally: if the rest of this turns
+     * into a conversation instead of a summary, the number is still logged. */
+    const typed = parseWeight(state.weightDraft);
+    if (typed !== null && typed !== todayWeighIn?.kg) await logWeight(typed);
+    const weighed = typed ?? todayWeighIn?.kg ?? null;
+
     const planned = session.exercises.reduce((n, ex) => n + ex.sets.length, 0);
     const done = session.exercises.reduce((n, ex) => n + ex.sets.filter((st) => st.d).length, 0);
 
@@ -401,7 +495,7 @@ export default function GymTracker() {
     const exercises = session.exercises
       .map((ex) => {
         const kept = ex.sets.filter((st) => st.d);
-        if (kept.length < ex.sets.length) skipped.push(`${ex.name} (${ex.sets.length - kept.length} of ${ex.sets.length})`);
+        if (kept.length < ex.sets.length) skipped.push(`${ex.name} (${ex.sets.length - kept.length} of ${ex.sets.length} sets)`);
         return { ...ex, sets: kept };
       })
       .filter((ex) => ex.sets.length > 0);
@@ -425,17 +519,91 @@ export default function GymTracker() {
       }
     }
 
+    /* Hand the coach the session itself rather than a pointer to it. It does get
+     * today's plan in its context, but at this exact moment the plan and what
+     * happened differ by every set that went unticked — and the reply has to
+     * quote real loads back at the athlete. Spelled out here, there is nothing
+     * to look up and nothing to get wrong. */
     askCoach(
-      `I've finished today's session — ${done} of ${planned} sets. Today's entry now shows only what I actually completed` +
-        (skipped.length ? `; I dropped what I skipped: ${skipped.join(", ")}.` : ".") +
-        " Log it as complete, update my lift records from every lift I trained, then give me the breakdown:" +
-        " volume, sets completed, and what to change next time.",
+      [
+        `I've finished today's session — ${session.title}, ${done} of ${planned} sets, ${sessionVolume(logged)} kg of volume.`,
+        "",
+        "Exactly what I trained, set by set:",
+        describeTrained(logged),
+        "",
+        skipped.length
+          ? `Skipped: ${skipped.join(", ")}.`
+          : "I completed every set that was planned.",
+        "",
+        weighed === null
+          ? "I didn't weigh in today."
+          : `Body weight today: ${weighed} kg${
+              lastWeighIn
+                ? ` — ${lastWeighIn.kg} kg on ${lastWeighIn.date}, so ${weighed - lastWeighIn.kg >= 0 ? "+" : "−"}${Math.abs(+(weighed - lastWeighIn.kg).toFixed(1))} kg`
+                : " (my first weigh-in)"
+            }. Already logged, so don't log it again — just factor it in.`,
+        "",
+        "That list is the session — it's already saved, so work from it rather than looking anything up." +
+          " Log the day complete, call upsert_record for every lift above using its heaviest set," +
+          " then give me the breakdown: volume, sets completed, and what to change next time.",
+      ].join("\n"),
       true,
     );
   };
 
+  /* ---- planning a day by hand ---- *
+   * Silent by design: the coach is handed every scheduled day in its context, so
+   * a day set here reaches it without spending a turn. The weekday pattern is
+   * stored beside it as a durable fact — the calendar alone can't tell the coach
+   * which days the athlete chose, because the coach is allowed to rewrite it. */
+  const applyPlan = async (iso: string, plan: Plan) => {
+    const next: Session = {
+      date: iso,
+      plan,
+      title: PLAN_DEFAULTS[plan].title,
+      groups: PLAN_DEFAULTS[plan].groups,
+      completed: false,
+      notes: "",
+      exercises: [],
+    };
+    const pattern = withSelfScheduledDay(state.memory[SELF_SCHEDULED_KEY], iso, plan);
+
+    setState((s) => ({
+      pendingPlan: null,
+      sessions: [...s.sessions.filter((x) => x.date !== iso), next].sort((a, b) => a.date.localeCompare(b.date)),
+      memory: { ...s.memory, [SELF_SCHEDULED_KEY]: pattern },
+    }));
+
+    /* Today is also written by the debounced saver watching the Today tab.
+     * Mark it saved so this write doesn't land twice. */
+    if (iso === today) {
+      window.clearTimeout(saveTimer.current);
+      savedTodayRef.current = JSON.stringify(next);
+    }
+
+    const supabase = getSupabase();
+    const uid = userIdRef.current;
+    if (!supabase || !uid) return;
+    try {
+      await saveSession(supabase, uid, next);
+      await setMemory(supabase, uid, SELF_SCHEDULED_KEY, pattern);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save that day.");
+    }
+  };
+
+  /* Replacing a day that already holds lifts is a delete, so it asks first. */
+  const choosePlan = (iso: string, plan: Plan) => {
+    const existing = byDate.get(iso);
+    if (existing && existing.exercises.length > 0) {
+      setState({ pendingPlan: plan });
+      return;
+    }
+    void applyPlan(iso, plan);
+  };
+
   /* ---- modal (a scheduled session) ---- */
-  const closeModal = () => setState({ modalPlan: null, dragY: 0, dragging: false });
+  const closeModal = () => setState({ modalPlan: null, pendingPlan: null, dragY: 0, dragging: false });
   const dragStart = (e: React.PointerEvent<HTMLDivElement>) => { dy0.current = e.clientY; e.currentTarget.setPointerCapture?.(e.pointerId); setState({ dragging: true }); };
   const dragMove = (e: React.PointerEvent<HTMLDivElement>) => { if (!state.dragging) return; setState({ dragY: Math.max(0, e.clientY - dy0.current) }); };
   const dragEnd = () => { if (state.dragY > 90) closeModal(); else setState({ dragY: 0, dragging: false }); };
@@ -478,7 +646,10 @@ export default function GymTracker() {
   /* ---- derived ---- */
   const doneCount = workout.filter((ex) => ex.sets.length > 0 && ex.sets.every((x) => x.d)).length;
   const sign = (v: number) => (v >= 0 ? "+" : "−") + Math.abs(v);
-  const modal = state.modalPlan ? byDate.get(state.modalPlan) ?? null : null;
+  /* The sheet opens on a date, not on a session — an unplanned day is exactly
+   * the one you want to open, and it has no session yet. */
+  const modalDate = state.modalPlan;
+  const modal = modalDate ? byDate.get(modalDate) ?? null : null;
 
   if (!ready) {
     return (
@@ -616,15 +787,26 @@ export default function GymTracker() {
                 const open = state.openEx === i;
                 return (
                   <div key={`${ex.name}-${i}`} style={{ borderBottom: "1px solid rgba(0,0,0,.07)" }}>
-                    <button onClick={() => toggleOpen(i)} style={{ display: "flex", alignItems: "center", gap: 14, padding: "18px 0", border: "none", background: "none", width: "100%", textAlign: "left", cursor: "pointer" }}>
-                      <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 20 }}>{String(i + 1).padStart(2, "0")}</div>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 17, fontWeight: 700, color: allDone ? "#9a9a92" : "#12120f" }}>{ex.name}</div>
+                    {/* The name is a link out to YouTube, so it can't sit inside
+                        the expand button. The counter and chevron carry that job
+                        instead, padded back out to the full height of the row so
+                        it stays a thumb-sized target. */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "18px 0" }}>
+                      <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 20, flex: "none" }}>{String(i + 1).padStart(2, "0")}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <ExerciseName name={ex.name} style={{ fontSize: 17, fontWeight: 700, color: allDone ? "#9a9a92" : "#12120f" }} />
                         <div className="mono" style={{ fontSize: 13, color: "#8a8a82", marginTop: 3 }}>{scheme(ex)}</div>
                       </div>
-                      <div className="mono" style={{ fontSize: 12, color: "#3c8cff", fontWeight: 600 }}>{ndone}/{nsets}</div>
-                      <div style={{ color: "#c3c1b8", fontSize: 14, transform: `rotate(${open ? 180 : 0}deg)`, transition: "transform .2s" }}>▾</div>
-                    </button>
+                      <button
+                        onClick={() => toggleOpen(i)}
+                        aria-expanded={open}
+                        aria-label={`${open ? "Hide" : "Show"} ${ex.name} sets`}
+                        style={{ display: "flex", alignItems: "center", gap: 14, flex: "none", border: "none", background: "none", padding: "18px 0 18px 18px", margin: "-18px 0", cursor: "pointer" }}
+                      >
+                        <span className="mono" style={{ fontSize: 12, color: "#3c8cff", fontWeight: 600 }}>{ndone}/{nsets}</span>
+                        <span style={{ color: "#c3c1b8", fontSize: 14, transform: `rotate(${open ? 180 : 0}deg)`, transition: "transform .2s" }}>▾</span>
+                      </button>
+                    </div>
                     {open && (
                       <div style={{ padding: "2px 0 16px 30px", display: "flex", flexDirection: "column", gap: 6 }}>
                         {/* Set rows fill the column at any window size: the label sits left,
@@ -654,6 +836,52 @@ export default function GymTracker() {
                   </div>
                 );
               })}
+              {/* ---- weigh-in, asked before the session goes to the coach ---- *
+                  Sits above Finish because that's the moment it's relevant: the
+                  coach reads body weight alongside volume, and a number typed
+                  here rides along with the summary instead of arriving a day
+                  late. Blank is a valid answer — no scales at the gym is not a
+                  reason to be unable to close the session out. */}
+              {workout.length > 0 && (
+                <>
+                  <div className="klabel" style={{ marginTop: 28 }}>Body weight</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
+                    <input
+                      value={state.weightDraft}
+                      onInput={(e) => setState({ weightDraft: (e.target as HTMLInputElement).value })}
+                      onKeyDown={(e) => {
+                        const kg = parseWeight(state.weightDraft);
+                        if (e.key === "Enter" && kg !== null) void logWeight(kg);
+                      }}
+                      inputMode="decimal"
+                      enterKeyHint="done"
+                      aria-label="Today's body weight in kilograms"
+                      placeholder={todayWeighIn ? String(todayWeighIn.kg) : lastWeighIn ? String(lastWeighIn.kg) : "—"}
+                      /* 16px, like every other field here — iOS zooms the page
+                         for anything smaller (see layout.tsx). */
+                      style={{
+                        width: 104, border: "1px solid #dcdad3", borderRadius: 12, padding: "11px 14px",
+                        font: "700 16px var(--font-space)", background: "#fff", outline: "none",
+                      }}
+                    />
+                    <span style={{ fontSize: 14, color: "#8a8a82", flex: 1 }}>kg</span>
+                    {parseWeight(state.weightDraft) !== null && parseWeight(state.weightDraft) !== todayWeighIn?.kg && (
+                      <button
+                        onClick={() => { const kg = parseWeight(state.weightDraft); if (kg !== null) void logWeight(kg); }}
+                        style={{ height: 38, padding: "0 16px", borderRadius: 19, border: "1px solid #dcdad3", background: "#fff", font: "600 13px var(--font-hanken)", color: "#12120f", cursor: "pointer", flex: "none" }}
+                      >
+                        Log
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: "#8a8a82", marginTop: 9, lineHeight: 1.45 }}>
+                    {todayWeighIn ? `${todayWeighIn.kg} kg logged today.` : "Not weighed in today."}
+                    {lastWeighIn ? ` Last was ${lastWeighIn.kg} kg on ${shortLabel(lastWeighIn.date)}.` : ""}
+                    {" Your coach gets this with the session summary."}
+                  </div>
+                </>
+              )}
+
               {workout.length > 0 && (
                 <button className="btnp" style={{ marginTop: 24 }} onClick={finish} disabled={state.thinking}>
                   {state.thinking ? "Coach is logging it…" : "Finish Workout"}
@@ -820,9 +1048,12 @@ export default function GymTracker() {
                   return (
                     <button
                       key={cell.key}
-                      onClick={() => cell.iso && session && session.exercises.length > 0 && setState({ modalPlan: cell.iso })}
-                      disabled={!session || session.exercises.length === 0}
-                      style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", border: "none", background: "none", padding: 0, cursor: session?.exercises.length ? "pointer" : "default" }}
+                      /* Every real day opens, planned or not — a blank day is
+                         where you'd want to put a split in the first place. */
+                      onClick={() => cell.iso && setState({ modalPlan: cell.iso, pendingPlan: null })}
+                      disabled={!cell.iso}
+                      aria-label={cell.iso ? `${longLabel(cell.iso)}${session ? ` — ${session.title}` : " — nothing planned"}` : undefined}
+                      style={{ aspectRatio: "1", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", border: "none", background: "none", padding: 0, cursor: cell.iso ? "pointer" : "default" }}
                     >
                       <span className="mono" style={{ fontSize: 14, color: isToday ? "#fff" : "#12120f", fontWeight: isToday ? 700 : 400, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "50%", background: isToday ? "#12120f" : "transparent" }}>
                         {cell.iso ? String(fromISO(cell.iso).getDate()) : ""}
@@ -854,14 +1085,14 @@ export default function GymTracker() {
                 {upcoming.map((p) => {
                   const rest = p.exercises.length === 0;
                   return (
-                    <button key={p.date} onClick={() => !rest && setState({ modalPlan: p.date })} style={{ display: "flex", gap: 14, alignItems: "center", padding: "15px 0", border: "none", borderBottom: "1px solid rgba(0,0,0,.07)", background: "none", width: "100%", textAlign: "left", cursor: rest ? "default" : "pointer" }}>
+                    <button key={p.date} onClick={() => setState({ modalPlan: p.date, pendingPlan: null })} style={{ display: "flex", gap: 14, alignItems: "center", padding: "15px 0", border: "none", borderBottom: "1px solid rgba(0,0,0,.07)", background: "none", width: "100%", textAlign: "left", cursor: "pointer" }}>
                       <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 44, flex: "none" }}>{shortLabel(p.date)}</div>
                       <div style={{ width: 6, height: 30, borderRadius: 4, background: PLAN_COLOR[p.plan], flex: "none" }} />
                       <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 16, fontWeight: 700, color: rest ? "#9a9a92" : "#12120f" }}>{p.title}</div>
                         <div className="mono" style={{ fontSize: 12, color: "#8a8a82" }}>{p.groups}</div>
                       </div>
-                      <div style={{ color: "#c3c1b8", fontSize: 18 }}>{rest ? "" : "›"}</div>
+                      <div style={{ color: "#c3c1b8", fontSize: 18 }}>›</div>
                     </button>
                   );
                 })}
@@ -957,7 +1188,7 @@ export default function GymTracker() {
         </div>
 
         {/* ===================== MODAL ===================== */}
-        {modal && (
+        {modalDate && (
           <div onClick={closeModal} style={{ position: "absolute", inset: 0, zIndex: 50, background: "rgba(18,18,15,.42)", display: "flex", alignItems: "flex-end" }}>
             <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxHeight: "82%", background: "#faf9f6", borderRadius: "26px 26px 38px 38px", padding: "0 26px 30px", overflowY: "auto", boxShadow: "0 -20px 50px -12px rgba(0,0,0,.35)", transform: `translateY(${state.dragY}px)`, transition: state.dragging ? "none" : "transform .25s ease" }}>
               <div onPointerDown={dragStart} onPointerMove={dragMove} onPointerUp={dragEnd} style={{ padding: "12px 0 8px", cursor: "grab", touchAction: "none" }}>
@@ -965,19 +1196,72 @@ export default function GymTracker() {
               </div>
               <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
                 <div>
-                  <div className="klabel">{shortLabel(modal.date)}</div>
-                  <h2 style={{ margin: "6px 0 3px", fontSize: 30, fontWeight: 800, letterSpacing: "-.02em" }}>{modal.title}</h2>
-                  <div style={{ fontSize: 14, color: "#6b6b64" }}>{modal.groups}</div>
+                  <div className="klabel">{longLabel(modalDate)}</div>
+                  <h2 style={{ margin: "6px 0 3px", fontSize: 30, fontWeight: 800, letterSpacing: "-.02em" }}>{modal?.title ?? "Nothing planned"}</h2>
+                  <div style={{ fontSize: 14, color: "#6b6b64" }}>{modal?.groups ?? "Pick a split to put it on the calendar"}</div>
                 </div>
-                <button onClick={() => reviewSession(modal)} style={{ display: "flex", alignItems: "center", gap: 6, height: 34, padding: "0 13px", borderRadius: 17, border: "none", background: "#12120f", color: "#fff", font: "600 13px var(--font-hanken)", cursor: "pointer", flex: "none" }}><span style={{ color: "#3c8cff" }}>✦</span>Ask Coach</button>
+                {modal && modal.exercises.length > 0 && (
+                  <button onClick={() => reviewSession(modal)} style={{ display: "flex", alignItems: "center", gap: 6, height: 34, padding: "0 13px", borderRadius: 17, border: "none", background: "#12120f", color: "#fff", font: "600 13px var(--font-hanken)", cursor: "pointer", flex: "none" }}><span style={{ color: "#3c8cff" }}>✦</span>Ask Coach</button>
+                )}
               </div>
-              <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 6 }}>{modal.exercises.length} exercises{modal.completed ? " · completed" : ""}</div>
-              {modal.notes && <div style={{ marginTop: 12, padding: "11px 13px", borderRadius: 12, background: "#efedE7", fontSize: 13, lineHeight: 1.45, color: "#4a4a44" }}>{modal.notes}</div>}
+
+              {/* ---- the split, set by hand ---- */}
+              <div className="klabel" style={{ marginTop: 20 }}>Plan</div>
+              <div style={{ display: "flex", gap: 8, marginTop: 9 }}>
+                {PLANS.map((p) => {
+                  const on = modal?.plan === p;
+                  return (
+                    <button
+                      key={p}
+                      onClick={() => choosePlan(modalDate, p)}
+                      aria-pressed={on}
+                      style={{
+                        flex: 1, height: 44, borderRadius: 13, cursor: "pointer",
+                        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4,
+                        border: on ? "none" : "1px solid #dcdad3",
+                        background: on ? "#12120f" : "#fff",
+                        color: on ? "#fff" : "#6b6b64",
+                        font: `${on ? 700 : 600} 13px var(--font-hanken)`,
+                      }}
+                    >
+                      <span style={{ width: 7, height: 7, borderRadius: "50%", background: PLAN_COLOR[p] }} />
+                      {p[0].toUpperCase() + p.slice(1)}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Re-planning a day that holds lifts deletes them, so it asks. */}
+              {state.pendingPlan && modal && (
+                <div style={{ marginTop: 12, padding: "13px 15px", borderRadius: 14, background: "#fdecec" }}>
+                  <div style={{ fontSize: 13, lineHeight: 1.45, color: "#8f2d2d" }}>
+                    Make this a {PLAN_DEFAULTS[state.pendingPlan].title.toLowerCase()}? It drops the {modal.exercises.length} lift
+                    {modal.exercises.length === 1 ? "" : "s"} on {shortLabel(modalDate)}
+                    {modal.completed ? ", which you've already logged as trained" : ""}.
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 11 }}>
+                    <button onClick={() => setState({ pendingPlan: null })} style={{ flex: 1, height: 38, borderRadius: 19, border: "1px solid #e3bcbc", background: "none", font: "600 13px var(--font-hanken)", color: "#8f2d2d", cursor: "pointer" }}>Cancel</button>
+                    <button onClick={() => void applyPlan(modalDate, state.pendingPlan!)} style={{ flex: 1, height: 38, borderRadius: 19, border: "none", background: "#8f2d2d", color: "#fff", font: "600 13px var(--font-hanken)", cursor: "pointer" }}>Replace</button>
+                  </div>
+                </div>
+              )}
+
+              <div className="mono" style={{ fontSize: 13, color: "#3c8cff", fontWeight: 600, marginTop: 16 }}>
+                {modal ? `${modal.exercises.length} exercises${modal.completed ? " · completed" : ""}` : "Not on the calendar yet"}
+              </div>
+              {modal?.notes && <div style={{ marginTop: 12, padding: "11px 13px", borderRadius: 12, background: "#efedE7", fontSize: 13, lineHeight: 1.45, color: "#4a4a44" }}>{modal.notes}</div>}
               <div style={{ ...hairline, margin: "16px -26px 0" }} />
-              {modal.exercises.map((e, i) => (
+              {modal && modal.exercises.length === 0 && (
+                <div style={{ fontSize: 14, color: "#8a8a82", padding: "16px 0", lineHeight: 1.5 }}>
+                  {modal.plan === "rest" ? "Rest day — nothing on the bar." : "No lifts on this day yet. Ask your coach to fill it in."}
+                </div>
+              )}
+              {(modal?.exercises ?? []).map((e, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "baseline", gap: 14, padding: "16px 0", borderBottom: "1px solid rgba(0,0,0,.07)" }}>
                   <div className="mono" style={{ fontSize: 13, color: "#c3c1b8", width: 20 }}>{String(i + 1).padStart(2, "0")}</div>
-                  <div style={{ flex: 1, fontSize: 16, fontWeight: 700 }}>{e.name}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <ExerciseName name={e.name} style={{ fontSize: 16, fontWeight: 700, color: "#12120f" }} />
+                  </div>
                   <div className="mono" style={{ fontSize: 13, color: "#8a8a82" }}>{scheme(e)}</div>
                 </div>
               ))}

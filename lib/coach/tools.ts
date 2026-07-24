@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Exercise, LiftPlan, PersistedState, Plan, RecordItem, Session } from "../types";
-import { shiftISO } from "../types";
+import { PLAN_DEFAULTS, PLANS, shiftISO } from "../types";
 import { deleteMemory, deleteSession, logBodyWeight, saveRecords, saveSession, saveSessions, setMemory } from "../db";
 import type { ToolDef } from "../minimax";
 
@@ -14,15 +14,6 @@ export interface ToolContext {
   today: string;
   state: PersistedState;
 }
-
-const PLAN_DEFAULTS: Record<Plan, { title: string; groups: string }> = {
-  push: { title: "Push Day", groups: "Chest · Shoulders · Triceps" },
-  pull: { title: "Pull Day", groups: "Back · Biceps" },
-  legs: { title: "Leg Day", groups: "Quads · Hamstrings" },
-  rest: { title: "Rest", groups: "Recovery day" },
-};
-
-const PLANS: Plan[] = ["push", "pull", "legs", "rest"];
 
 /* ------------------------------------------------------------------ utils */
 

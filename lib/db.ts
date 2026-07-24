@@ -1,6 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Exercise, LiftPlan, Message, PersistedState, Plan, RecordItem, Session, WeighIn } from "./types";
-import { toISO } from "./types";
 
 /* Every function takes the client explicitly: the browser passes its anon
  * client, the coach API route passes a request-scoped client carrying the
@@ -66,7 +65,13 @@ export async function loadState(s: SupabaseClient, userId: string): Promise<Pers
     .sort(byPos)
     .map((m) => ({ from: m.sender, text: m.body, actions: Array.isArray(m.actions) && m.actions.length ? m.actions : undefined }));
 
-  const weighIns: WeighIn[] = (bwRes.data ?? []).map((b) => ({ date: toISO(new Date(b.logged_at)), kg: num(b.weight_kg) }));
+  /* UTC, to match how `logBodyWeight` wrote it — converting into the reader's
+   * local day would date the same weigh-in differently in the browser and in
+   * the coach's context. */
+  const weighIns: WeighIn[] = (bwRes.data ?? []).map((b) => ({
+    date: new Date(b.logged_at).toISOString().slice(0, 10),
+    kg: num(b.weight_kg),
+  }));
 
   const memory: Record<string, string> = {};
   (memRes.data ?? []).forEach((m) => { memory[m.key] = m.value; });
@@ -171,18 +176,21 @@ export async function appendMessages(s: SupabaseClient, userId: string, messages
 
 /* ------------------------------------------------------------ body weight */
 
-/** Append-only history: one weigh-in per day, so re-logging corrects today's. */
-export async function logBodyWeight(s: SupabaseClient, userId: string, kg: number, date?: string) {
-  const at = date ? new Date(`${date}T12:00:00`) : new Date();
-  const dayStart = new Date(at); dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(at); dayEnd.setHours(23, 59, 59, 999);
+/** Append-only history: one weigh-in per day, so re-logging corrects today's.
+ *
+ *  A weigh-in is a calendar day, not an instant, but `logged_at` is a timestamptz
+ *  — so pin it to midday UTC and read it back in UTC (see `loadState`). Anchoring
+ *  it to whichever machine happened to write it would make the same row a
+ *  different day to the browser than to the coach. `date` is required for the
+ *  same reason: the server's own clock is never the athlete's. */
+export async function logBodyWeight(s: SupabaseClient, userId: string, kg: number, date: string) {
   await s
     .from("body_weight_logs")
     .delete()
     .eq("user_id", userId)
-    .gte("logged_at", dayStart.toISOString())
-    .lte("logged_at", dayEnd.toISOString());
-  await s.from("body_weight_logs").insert({ user_id: userId, weight_kg: kg, logged_at: at.toISOString() });
+    .gte("logged_at", `${date}T00:00:00.000Z`)
+    .lte("logged_at", `${date}T23:59:59.999Z`);
+  await s.from("body_weight_logs").insert({ user_id: userId, weight_kg: kg, logged_at: `${date}T12:00:00.000Z` });
 }
 
 /* ------------------------------------------------------------------ memory */

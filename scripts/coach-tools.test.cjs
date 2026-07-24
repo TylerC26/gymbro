@@ -3,7 +3,7 @@
 const { EXECUTORS, TOOLS } = require("../build/tooltest/coach/tools");
 const { buildContext } = require("../build/tooltest/coach/context");
 const { buildSeed } = require("../build/tooltest/seed");
-const { todayISO, shiftISO } = require("../build/tooltest/types");
+const { todayISO, shiftISO, describeTrained, withSelfScheduledDay } = require("../build/tooltest/types");
 
 /** Chainable stub: records what was written, resolves like PostgREST does. */
 function fakeClient() {
@@ -223,6 +223,40 @@ async function expectThrow(label, fn, match) {
   check("context includes body weight trend", /BODY WEIGHT: [\d.]+ kg/.test(context));
   check("context includes stored facts", context.includes("goal: cut to 75 kg"));
   check("context stays a reasonable size", context.length < 12000, `${context.length} chars`);
+
+  /* ---- the session the Finish button hands the coach ----
+   * It is embedded in the message rather than read back off the log, so the
+   * loads the coach quotes and the records it writes come from one place. */
+  const trained = describeTrained({
+    date: today, title: "Push Day", groups: "", plan: "push", completed: true, notes: "",
+    exercises: [
+      { name: "Barbell Bench Press", sets: [{ w: 62.5, r: 8, d: true }, { w: 65, r: 6, d: true }] },
+      { name: "Dips", sets: [{ w: 0, r: 12, d: true }] },
+    ],
+  });
+  check("finish summary numbers every lift", /^1\. Barbell Bench Press/m.test(trained) && /^2\. Dips/m.test(trained));
+  check("finish summary spells out each set with units", trained.includes("62.5kg × 8, 65kg × 6"), trained.split("\n")[0]);
+  check("finish summary names the heaviest set records are written from", trained.includes("(heaviest 65 kg)"));
+  check("finish summary never offers 0 kg as a record", !/heaviest 0 kg/.test(trained), trained.split("\n")[1]);
+  check("finish summary calls an unloaded lift bodyweight", trained.includes("Dips — bodyweight × 12 (bodyweight — no load to record)"));
+
+  /* ---- days the athlete lays out by hand ----
+   * Tapping a day writes the session; this is the durable fact that goes with
+   * it, so the coach knows the athlete sets their own week. Dates below are a
+   * Mon / Wed / Fri in July 2026. */
+  const days = (v) => v.split(" —")[0];
+  let pattern = withSelfScheduledDay("", "2026-07-27", "push");
+  check("a hand-set day becomes a weekday fact", days(pattern) === "Mon push", pattern);
+  pattern = withSelfScheduledDay(pattern, "2026-07-29", "pull");
+  pattern = withSelfScheduledDay(pattern, "2026-07-31", "legs");
+  check("further days accumulate", days(pattern) === "Mon push, Wed pull, Fri legs", pattern);
+  pattern = withSelfScheduledDay(pattern, "2026-08-03", "rest");
+  check("re-setting a weekday corrects instead of duplicating", days(pattern) === "Mon rest, Wed pull, Fri legs", pattern);
+  const tappedBackwards = withSelfScheduledDay(withSelfScheduledDay("", "2026-07-31", "legs"), "2026-07-27", "push");
+  check("week order holds however the days were tapped", days(tappedBackwards) === "Mon push, Fri legs", tappedBackwards);
+  check("the fact says who set the days", / the athlete sets these days on the calendar themselves$/.test(pattern));
+  check("the note survives a round trip without stacking up", pattern.match(/athlete sets/g).length === 1, pattern);
+  check("the pattern stays one line for the system prompt", !pattern.includes("\n"));
 
   console.log(`\n${failures === 0 ? "all checks passed" : `${failures} check(s) failed`}`);
   process.exit(failures ? 1 : 0);
